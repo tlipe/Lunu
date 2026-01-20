@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.spec
+
+# Rust
+target/
+**/*.rs.bk
+
+# Lunu
+logs/
+config/.secrets.json
+config/cert.pem
+config/key.pem
+
+# Builder
+builder/build/
+*.exe
+*.pdb
+*.obj
+
+# Editor
+.vscode/
+.idea/

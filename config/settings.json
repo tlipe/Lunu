@@ -1,0 +1,19 @@
+{
+    "server": {
+        "host": "127.0.0.1",
+        "http_port": 8000,
+        "workers": 1,
+        "ssl_enabled": false,
+        "ssl_cert_path": "./config/cert.pem",
+        "ssl_key_path": "./config/key.pem"
+    },
+    "security": {
+        "auth_enabled": true,
+        "rate_limit_per_minute": 600,
+        "allowed_hosts": ["127.0.0.1", "localhost"]
+    },
+    "logging": {
+        "level": "INFO",
+        "file": "./logs/lunu.log"
+    }
+}
