@@ -1,0 +1,7 @@
+{
+  "aliases": {
+    "lune": "~/.lune/.typedefs/0.10.4/",
+    "numpy": "modules/numpy/",
+    "lunu": "Lunu/"
+  }
+}

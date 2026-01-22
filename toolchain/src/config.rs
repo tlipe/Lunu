@@ -42,4 +42,8 @@ impl Luaurc {
     pub fn add_alias(&mut self, name: &str, path: &str) {
         self.aliases.insert(name.to_string(), path.to_string());
     }
+
+    pub fn remove_alias(&mut self, name: &str) {
+        self.aliases.remove(name);
+    }
 }

@@ -22,6 +22,8 @@ impl CompatibilityLayer {
             println!("Detected Wally project. Resolving dependencies is not yet fully supported, but files are intact.");
         }
 
+        Self::ensure_manifest(path).await?;
+
         Ok(())
     }
 
@@ -45,6 +47,34 @@ impl CompatibilityLayer {
         export_lines.push("}".to_string());
         
         fs::write(path.join("init.luau"), export_lines.join("\n")).await?;
+        Ok(())
+    }
+
+    async fn ensure_manifest(path: &Path) -> Result<()> {
+        let manifest_path = path.join("lunu.toml");
+        if manifest_path.exists() {
+            return Ok(());
+        }
+
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("lunu-lib");
+
+        let entry = if path.join("init.luau").exists() {
+            "init.luau"
+        } else if path.join("init.lua").exists() {
+            "init.lua"
+        } else {
+            "init.luau"
+        };
+
+        let content = format!(
+            "name = \"{}\"\nversion = \"0.1.0\"\nentry = \"{}\"\nlanguage = \"luau\"\n",
+            name, entry
+        );
+
+        fs::write(manifest_path, content).await?;
         Ok(())
     }
 }

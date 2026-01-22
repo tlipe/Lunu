@@ -65,7 +65,15 @@ impl PackageManager {
         Ok(())
     }
 
-    async fn calculate_dir_checksum(&self, path: &Path) -> Result<String> {
+    pub async fn remove_package(&self, name: &str) -> Result<()> {
+        let install_path = self.root_dir.join("modules").join(name).clean();
+        if install_path.exists() {
+            fs::remove_dir_all(&install_path).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn calculate_dir_checksum(&self, path: &Path) -> Result<String> {
         let mut hasher = Sha256::new();
         let mut entries = Vec::new();
 

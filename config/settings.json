@@ -15,5 +15,6 @@
     "logging": {
         "level": "INFO",
         "file": "./logs/lunu.log"
-    }
+    },
+    "modules_dir": "modules"
 }
