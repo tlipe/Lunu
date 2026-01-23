@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::Command;
 use anyhow::{Result, Context};
 use config::Luaurc;
 use github::GithubClient;
@@ -27,7 +28,7 @@ use tokio::fs as async_fs;
 #[command(about = "Lunu Toolchain Manager", long_about = None)]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -124,33 +125,36 @@ async fn main() -> Result<()> {
     let root = find_root(&cwd).unwrap_or(cwd.clone());
     
     // Don't print "Lunu Root" for bridge/dev command to keep stdout clean
-    if !matches!(cli.command, Commands::Bridge { .. } | Commands::Dev) {
+    if !matches!(cli.command, Some(Commands::Bridge { .. }) | Some(Commands::Dev)) && cli.command.is_some() {
         println!("Lunu Root: {:?}", root);
     }
 
     match cli.command {
-        Commands::Init => {
+        None => {
+            startup(&root).await?;
+        },
+        Some(Commands::Init) => {
             init_project(&root).await?;
         },
-        Commands::Create { name } => {
+        Some(Commands::Create { name }) => {
             create_project(&cwd, &name).await?;
         },
-        Commands::Install => {
+        Some(Commands::Install) => {
             install_from_config(&root).await?;
         },
-        Commands::Remove { lib } => {
+        Some(Commands::Remove { lib }) => {
             remove_dependency(&root, &lib).await?;
         },
-        Commands::Update { lib } => {
+        Some(Commands::Update { lib }) => {
             update_dependencies(&root, lib.as_deref()).await?;
         },
-        Commands::List => {
+        Some(Commands::List) => {
             list_dependencies(&root).await?;
         },
-        Commands::Package => {
+        Some(Commands::Package) => {
             package_project(&root).await?;
         },
-        Commands::Daemon { command } => {
+        Some(Commands::Daemon { command }) => {
             let lunu_root = resolve_lunu_root(&root);
             match command {
                 DaemonCommands::Status => {
@@ -161,19 +165,19 @@ async fn main() -> Result<()> {
                 }
             }
         },
-        Commands::Check => {
+        Some(Commands::Check) => {
             check_environment(&root).await?;
         },
-        Commands::Bridge { daemon } => {
+        Some(Commands::Bridge { daemon }) => {
             let bridge = BridgeManager::new(root);
             bridge.start(daemon)?;
         },
-        Commands::Dev => {
+        Some(Commands::Dev) => {
             println!("Starting Lunu Dev Server...");
             let bridge = BridgeManager::new(root);
             bridge.start(false)?; // False = Foreground
         },
-        Commands::Build { script, output, force, open, icon, open_cmd } => {
+        Some(Commands::Build { script, output, force, open, icon, open_cmd }) => {
             // Locate lunu-builder.exe
             let exe_path = std::env::current_exe()?;
             let exe_dir = exe_path.parent().context("Failed to get exe dir")?;
@@ -219,7 +223,7 @@ async fn main() -> Result<()> {
                 return Err(anyhow::anyhow!("Build failed with exit code: {:?}", status.code()));
             }
         },
-        Commands::Add { query, alias } => {
+        Some(Commands::Add { query, alias }) => {
             println!("Searching for '{}'...", query);
             
             // 1. Search
@@ -670,6 +674,39 @@ async fn check_environment(root: &Path) -> Result<()> {
     println!("- Modules directory: {}", modules_dir.exists());
     println!("- Entry file: {}", src_main.exists());
     println!("- Builder executable: {}", builder_exe.exists());
+    Ok(())
+}
+
+async fn startup(root: &Path) -> Result<()> {
+    let lunu_root = resolve_lunu_root(root);
+    let setup = lunu_root.join("scripts").join("setup.ps1");
+    if !setup.exists() {
+        return Err(anyhow::anyhow!("Setup script not found at {:?}", setup));
+    }
+    let status = Command::new("powershell")
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-File")
+        .arg(&setup)
+        .status()?;
+    if !status.success() {
+        return Err(anyhow::anyhow!("Startup failed running {:?}", setup));
+    }
+    let install = lunu_root.join("scripts").join("install.ps1");
+    if install.exists() {
+        let status = Command::new("powershell")
+            .arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(&install)
+            .status()?;
+        if !status.success() {
+            return Err(anyhow::anyhow!("Startup failed running {:?}", install));
+        }
+    }
+    println!("Lunu startup completed.");
     Ok(())
 }
 

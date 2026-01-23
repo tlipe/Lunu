@@ -16,6 +16,7 @@ anyhow = "1.0"
 thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 git2 = { version = "0.18", default-features = false, features = ["https", "openssl-sys"] }
 dirs = "5.0"
 sha2 = "0.10"
@@ -25,6 +26,18 @@ tempfile = "3.10"
 path-clean = "1.0"
 futures = "0.3"
 pathdiff = "0.2"
+axum = { version = "0.7", features = ["macros", "json"] }
+tower-http = { version = "0.5", features = ["trace"] }
+rand = "0.8"
+winreg = "0.55.0"
+
+[[bin]]
+name = "lunu-bridge"
+path = "src/bin/bridge.rs"
+
+[[bin]]
+name = "lunu"
+path = "src/bin/installer.rs"
 
 [profile.release]
 lto = true

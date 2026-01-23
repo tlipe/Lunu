@@ -18,22 +18,15 @@ impl BridgeManager {
     }
 
     pub fn start(&self, daemon: bool) -> Result<()> {
-        let python_path = self.lunu_root.join(".venv").join("Scripts").join("python.exe");
-        let server_script = self.lunu_root.join("src").join("bridge").join("server.py");
-
-        if !python_path.exists() {
-            return Err(anyhow!("Python environment not found at {:?}.\nPlease run 'scripts/setup.ps1' inside Lunu folder.", python_path));
-        }
+        let bridge_exe = find_bridge_exe(&self.lunu_root)?;
 
         if !daemon {
             println!("Starting Lunu Bridge Server...");
-            println!("   Python: {:?}", python_path);
-            println!("   Script: {:?}", server_script);
+            println!("   Executable: {:?}", bridge_exe);
             println!("   Mode: Foreground (Press Ctrl+C to stop)");
         }
 
-        let mut cmd = Command::new(&python_path);
-        cmd.arg(&server_script);
+        let mut cmd = Command::new(&bridge_exe);
         cmd.current_dir(&self.lunu_root); // Critical: Server expects to run from Lunu root
 
         if daemon {
@@ -64,4 +57,23 @@ impl BridgeManager {
 
         Ok(())
     }
+}
+
+fn find_bridge_exe(lunu_root: &PathBuf) -> Result<PathBuf> {
+    let mut candidates = Vec::new();
+    candidates.push(lunu_root.join("bin").join("lunu-bridge.exe"));
+    candidates.push(lunu_root.join("lunu-bridge.exe"));
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(dir) = exe_path.parent() {
+            candidates.push(dir.join("lunu-bridge.exe"));
+        }
+    }
+
+    for candidate in candidates {
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(anyhow!("Lunu Bridge executable not found. Please run toolchain build to generate lunu-bridge.exe."))
 }

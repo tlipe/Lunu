@@ -32,7 +32,7 @@ if not LUNU_DIR then
     -- Fallback: If we are running inside the compiled exe, Lunu is embedded at root or src/libs
     if fs.isFile("config/settings.json") then
         LUNU_DIR = resolve_path(".")
-    elseif fs.isFile("src/bridge/server.py") then
+    elseif fs.isFile("bin/lunu-bridge.exe") then
         LUNU_DIR = resolve_path(".")
     else
          -- Last resort, maybe we are in Lunu folder itself
@@ -82,33 +82,31 @@ end
 local function start_server()
     print("[Lunu] Attempting to start local Bridge server...")
     
-    local server_script = "./src/bridge/server.py"
+    local server_exe = "bin/lunu-bridge.exe"
     
-    if not fs.isFile(server_script) then
-        if LUNU_DIR and fs.isFile(LUNU_DIR .. "src/bridge/server.py") then
-            server_script = LUNU_DIR .. "src/bridge/server.py"
-        elseif fs.isFile("Lunu/src/bridge/server.py") then
-            server_script = "Lunu/src/bridge/server.py"
+    if not fs.isFile(server_exe) then
+        if LUNU_DIR and fs.isFile(LUNU_DIR .. "bin/lunu-bridge.exe") then
+            server_exe = LUNU_DIR .. "bin/lunu-bridge.exe"
+        elseif fs.isFile("Lunu/bin/lunu-bridge.exe") then
+            server_exe = "Lunu/bin/lunu-bridge.exe"
+        elseif fs.isFile("lunu-bridge.exe") then
+            server_exe = "lunu-bridge.exe"
         end
     end
     
-    if not fs.isFile(server_script) then
-         error("\n[Lunu] The Bridge server is offline and could not be auto-started.\nServer script not found at: " .. server_script .. "\nPlease run: lunu dev")
+    if not fs.isFile(server_exe) then
+         error("\n[Lunu] The Bridge server is offline and could not be auto-started.\nServer executable not found at: " .. server_exe .. "\nPlease run: lunu dev")
     end
 
-    print("[Lunu] Spawning Python Bridge: " .. server_script)
+    print("[Lunu] Spawning Bridge: " .. server_exe)
 
     local log_file = "server_startup.log"
-    local python_cmd = "python"
-    if process.env and process.env.LUNU_PYTHON and #process.env.LUNU_PYTHON > 0 then
-        python_cmd = process.env.LUNU_PYTHON
-    end
-    local server_script_win = string.gsub(server_script, "/", "\\")
-    if string.sub(server_script_win, 1, 2) == ".\\" then
-        server_script_win = string.sub(server_script_win, 3)
+    local server_exe_win = string.gsub(server_exe, "/", "\\")
+    if string.sub(server_exe_win, 1, 2) == ".\\" then
+        server_exe_win = string.sub(server_exe_win, 3)
     end
     
-    local bat_content = "@echo off\r\n\"" .. python_cmd .. "\" \"" .. server_script_win .. "\" > " .. log_file .. " 2>&1"
+    local bat_content = "@echo off\r\n\"" .. server_exe_win .. "\" > " .. log_file .. " 2>&1"
     fs.writeFile("run_server.cmd", bat_content)
 
     local child = process.create("cmd", { "/C", "run_server.cmd" }, {
