@@ -1,0 +1,12 @@
+{
+  "protocol": "lunu-worker-v1",
+  "worker": {
+    "cmd": ["python", "worker.py"],
+    "cwd": ".",
+    "env": {}
+  },
+  "methods": {
+    "hello": {},
+    "echo": {}
+  }
+}

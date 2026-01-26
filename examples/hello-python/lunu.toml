@@ -1,0 +1,7 @@
+[project]
+name = "hello-python"
+entry = "src/main.luau"
+modules_dir = "modules"
+
+[dependencies.lunu]
+path = "modules/lunu"

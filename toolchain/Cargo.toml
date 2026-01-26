@@ -1,0 +1,50 @@
+[package]
+name = "lunu-cli"
+version = "0.0.1"
+edition = "2021"
+authors = ["Lunu Toolchain"]
+description = "Robust library management toolchain for Lunu"
+
+[dependencies]
+winapi = { version = "0.3", features = ["winuser"] }
+tokio = { version = "1.36", features = ["full"] }
+reqwest = { version = "0.11", features = ["json", "rustls-tls", "gzip", "brotli"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+git2 = { version = "0.18", default-features = false, features = ["https", "openssl-sys"] }
+dirs = "5.0"
+sha2 = "0.10"
+hex = "0.4"
+fs_extra = "1.3"
+tempfile = "3.10"
+path-clean = "1.0"
+futures = "0.3"
+pathdiff = "0.2"
+axum = { version = "0.7", features = ["macros", "json"] }
+tower-http = { version = "0.5", features = ["trace"] }
+rand = "0.8"
+winreg = "0.55.0"
+lunu-builder = { path = "../builder" }
+
+[lib]
+name = "lunu_cli"
+path = "src/lib.rs"
+
+
+[[bin]]
+name = "lunu"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = "z" # Optimized for size
+panic = "abort" # Remove panic unwinding overhead

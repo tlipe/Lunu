@@ -1,0 +1,21 @@
+{
+  "logging": {
+    "file": "logs/server.log",
+    "level": "info"
+  },
+  "security": {
+    "allowed_hosts": [
+      "127.0.0.1",
+      "localhost"
+    ],
+    "auth_enabled": true
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "http_port": 8000,
+    "ssl_cert_path": "",
+    "ssl_enabled": false,
+    "ssl_key_path": ""
+  },
+  "modules_dir": "../../modules"
+}

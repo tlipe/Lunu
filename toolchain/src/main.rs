@@ -1,0 +1,1155 @@
+mod config;
+mod github;
+mod package;
+mod compat;
+mod project;
+mod lock;
+
+use clap::{Parser, Subcommand, ValueEnum};
+use lunu_cli::bridge_server;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::Command;
+use anyhow::{Result, Context};
+use config::Luaurc;
+use github::GithubClient;
+use package::PackageManager;
+use compat::CompatibilityLayer;
+use project::{ProjectConfig, DependencySpec};
+use lock::{LockFile, LockEntry};
+use fs_extra::dir::{copy as copy_dir, CopyOptions};
+use serde_json::Value;
+use tokio::fs as async_fs;
+
+use std::io::Write;
+#[cfg(windows)]
+use winreg::enums::*;
+#[cfg(windows)]
+use winreg::RegKey;
+
+
+#[derive(Parser)]
+#[command(name = "lunu")]
+#[command(version = "0.0.1")]
+#[command(about = "Lunu Toolchain Manager", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Add a library from GitHub
+    Add {
+        /// Search query (e.g., "numpy-luau" or "user/repo")
+        query: String,
+        
+        /// Alias name for local usage (optional, defaults to repo name)
+        #[arg(short, long)]
+        alias: Option<String>,
+    },
+    /// Start the Lunu Bridge Server in development mode (foreground)
+    Dev,
+    /// Build a Luau script into an executable
+    Build {
+        /// The entry point script (e.g., main.luau)
+        script: PathBuf,
+
+        /// Output filename (optional)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Force rebuild ignoring cache
+        #[arg(short, long)]
+        force: bool,
+
+        /// Open the output after successful build
+        #[arg(long)]
+        open: bool,
+
+        /// Custom icon path for the executable
+        #[arg(long)]
+        icon: Option<PathBuf>,
+
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        open_cmd: Option<bool>,
+    },
+    /// Initialize a Lunu project in the current directory
+    Init,
+    /// Install dependencies from lunu.toml
+    Install,
+    /// Remove a dependency
+    Remove {
+        /// Library name to remove
+        lib: String,
+    },
+    /// Update dependencies
+    Update {
+        /// Library name to update (optional)
+        lib: Option<String>,
+    },
+    /// List installed dependencies
+    List,
+    /// Package the project for distribution
+    Package,
+    /// Validate project environment
+    Check,
+    /// Create a new project
+    Create {
+        /// Project name (creates a folder with this name)
+        name: String,
+    },
+    /// Upgrade Lunu to the latest version
+    Upgrade,
+    /// Uninstall Lunu from the system
+    Uninstall,
+    /// Scaffold a new project with a template
+    Scaffold {
+        /// Project name (creates a folder with this name)
+        name: String,
+        /// Template type
+        #[arg(short, long, value_enum, default_value_t = TemplateKind::App)]
+        template: TemplateKind,
+    },
+    /// Create a bridge module scaffold
+    Module {
+        /// Module name (creates modules/<name>)
+        name: String,
+        /// Worker language
+        #[arg(short, long, value_enum, default_value_t = ModuleLang::Python)]
+        lang: ModuleLang,
+    },
+    /// Profile a Luau script using the Lune runtime
+    Profile {
+        /// The entry point script (e.g., src/main.luau)
+        script: PathBuf,
+        /// Number of runs
+        #[arg(short, long, default_value_t = 1)]
+        runs: u32,
+    },
+}
+
+#[derive(ValueEnum, Clone)]
+enum TemplateKind {
+    App,
+    Game,
+}
+
+#[derive(ValueEnum, Clone)]
+enum ModuleLang {
+    Python,
+    Node,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // Only init default logging if NOT bridge/dev
+    if !matches!(cli.command, Some(Commands::Dev)) {
+         tracing_subscriber::fmt::init();
+    }
+
+    // Determine Root (Parent of toolchain or CWD)
+    // Assuming toolchain is running from Lunu/toolchain, root is Lunu/.. (Libs folder)
+    // But user input implies running in Lunu folder. Let's find .luaurc or use CWD.
+    let cwd = std::env::current_dir()?;
+    // Search up for .luaurc
+    let root = find_root(&cwd).unwrap_or(cwd.clone());
+    
+    // Don't print "Lunu Root" for bridge/dev command to keep stdout clean
+    if !matches!(cli.command, Some(Commands::Dev)) && cli.command.is_some() {
+        println!("Lunu Root: {:?}", root);
+    }
+
+    match cli.command {
+        None => {
+            // Check if we are installed
+            if is_installed()? {
+                 println!("Lunu is installed! Run 'lunu --help' to see available commands.");
+            } else {
+                 install_self().await?;
+            }
+        },
+        Some(Commands::Init) => {
+            init_project(&cwd).await?;
+        },
+        Some(Commands::Create { name }) => {
+            create_project(&cwd, &name).await?;
+        },
+        Some(Commands::Install) => {
+            install_from_config(&root).await?;
+        },
+        Some(Commands::Remove { lib }) => {
+            remove_dependency(&root, &lib).await?;
+        },
+        Some(Commands::Update { lib }) => {
+            update_dependencies(&root, lib.as_deref()).await?;
+        },
+        Some(Commands::List) => {
+            list_dependencies(&root).await?;
+        },
+        Some(Commands::Package) => {
+            package_project(&root).await?;
+        },
+        Some(Commands::Check) => {
+            check_environment(&root).await?;
+        },
+        Some(Commands::Dev) => {
+            println!("Starting Lunu Dev Server...");
+            bridge_server::run().await?;
+        },
+        Some(Commands::Build { script, output, force, open, icon, open_cmd }) => {
+            // Internal Builder
+            lunu_builder::build_executable(&script, output, force, open, icon, open_cmd, None)?;
+        },
+        Some(Commands::Scaffold { name, template }) => {
+            scaffold_project(&cwd, &name, template).await?;
+        },
+        Some(Commands::Module { name, lang }) => {
+            create_module(&root, &name, lang).await?;
+        },
+        Some(Commands::Profile { script, runs }) => {
+            profile_script(&root, &script, runs)?;
+        },
+        Some(Commands::Add { query, alias }) => {
+            println!("Searching for '{}'...", query);
+            
+            // 1. Search
+            let gh = GithubClient::new(None)?;
+            let results = gh.search_packages(&query).await?;
+            
+            if results.is_empty() {
+                println!("No packages found.");
+                return Ok(());
+            }
+
+            let target = &results[0];
+            println!("Found: {}/{} ({})", target.owner, target.name, target.url);
+
+            // 2. Install
+            let pm = PackageManager::new(root.clone());
+            let install_name = alias.unwrap_or(target.name.clone());
+            
+            let (path, checksum) = pm.install_package(&target.url, None, &install_name).await?;
+            println!("Installed to {:?} (Checksum: {})", path, checksum);
+
+            // 3. Compat
+            CompatibilityLayer::ensure_compat(&path).await?;
+
+            // 4. Update Config
+            let config_path = root.join(".luaurc");
+            let mut config = Luaurc::load(&config_path).await?;
+            
+            // Lunu specific mapping: mapping modules/name to alias
+            // Standard Lune alias format: "alias": "path/to/module"
+            // Relative to .luaurc
+            let rel_path = pathdiff::diff_paths(&path, &root).unwrap_or(path);
+            let rel_path_str = rel_path.to_string_lossy().replace("\\", "/") + "/"; // Add trailing slash for directory modules
+            
+            config.add_alias(&install_name, &rel_path_str);
+            config.save(&config_path).await?;
+            
+            println!("Updated .luaurc with alias '{}'", install_name);
+
+            let config_path = project_config_path(&root);
+            let mut proj = load_or_init_project(&root, &config_path).await?;
+            let mut spec = DependencySpec::default();
+            spec.url = Some(target.url.clone());
+            spec.path = Some(rel_path_str.trim_end_matches('/').to_string());
+            proj.add_dependency(&install_name, spec);
+            proj.save(&config_path).await?;
+
+            let lock_path = lock_path(&root);
+            let mut lock = LockFile::load(&lock_path).await?;
+            lock.set(&install_name, LockEntry {
+                url: Some(target.url.clone()),
+                version: None,
+                path: Some(rel_path_str.trim_end_matches('/').to_string()),
+                checksum,
+                installed_at: current_timestamp(),
+            });
+            lock.save(&lock_path).await?;
+        },
+        Some(Commands::Upgrade) => {
+            self_update().await?;
+        },
+        Some(Commands::Uninstall) => {
+            self_uninstall().await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn self_update() -> Result<()> {
+    println!("Checking for updates...");
+    let client = reqwest::Client::new();
+    let resp = client.get("https://api.github.com/repos/tlipe/Lunu/releases/latest")
+        .header("User-Agent", "Lunu-CLI")
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+
+    let latest_tag = resp["tag_name"].as_str().ok_or(anyhow::anyhow!("Failed to parse release tag"))?;
+    let current_version = env!("CARGO_PKG_VERSION");
+    let current_tag = format!("v{}", current_version);
+
+    if latest_tag == current_tag {
+        println!("Lunu is already up to date ({})", current_tag);
+        return Ok(());
+    }
+
+    println!("New version available: {} (Current: {})", latest_tag, current_tag);
+    println!("Updating...");
+
+    // Find asset
+    let assets = resp["assets"].as_array().ok_or(anyhow::anyhow!("No assets found"))?;
+    let asset = assets.iter()
+        .find(|a| a["name"].as_str() == Some("lunu.exe"))
+        .ok_or(anyhow::anyhow!("lunu.exe not found in release assets"))?;
+    
+    let download_url = asset["browser_download_url"].as_str().unwrap();
+
+    // Download
+    let bytes = client.get(download_url).send().await?.bytes().await?;
+    
+    let current_exe = std::env::current_exe()?;
+    let old_exe = current_exe.with_extension("exe.old");
+    
+    // Rename current to .old (Windows allows renaming running exe)
+    if old_exe.exists() {
+        let _ = async_fs::remove_file(&old_exe).await;
+    }
+    async_fs::rename(&current_exe, &old_exe).await?;
+    
+    // Write new
+    async_fs::write(&current_exe, bytes).await?;
+    
+    println!("Updated successfully to {}!", latest_tag);
+    Ok(())
+}
+
+async fn self_uninstall() -> Result<()> {
+    println!("Uninstalling Lunu...");
+    let home_dir = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+    let install_dir = home_dir.join(".lunu");
+
+    // Remove from PATH
+    #[cfg(windows)]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        if let Ok(env) = hkcu.open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE) {
+            if let Ok(path_val) = env.get_value::<String, _>("Path") {
+                let bin_dir = install_dir.join("bin");
+                let bin_dir_str = bin_dir.to_str().unwrap_or("");
+                
+                if !bin_dir_str.is_empty() && path_val.to_lowercase().contains(&bin_dir_str.to_lowercase()) {
+                    let new_path = path_val.split(';')
+                        .filter(|p| !p.to_lowercase().contains(&bin_dir_str.to_lowercase()))
+                        .collect::<Vec<_>>()
+                        .join(";");
+                    let _ = env.set_value("Path", &new_path);
+                    println!("Removed from PATH.");
+                }
+            }
+        }
+    }
+
+    // Remove directory
+    if install_dir.exists() {
+        // Self-deletion check
+        let current_exe = std::env::current_exe()?;
+        if current_exe.starts_with(&install_dir) {
+             let temp_exe = std::env::temp_dir().join(format!("lunu_uninstall_{}.exe", std::process::id()));
+             
+             // Copy self to temp to finish uninstallation
+             // Actually, we can just schedule deletion on reboot or use a batch script
+             // But simpler: just rename self and try to delete dir, ignoring self error
+             let old_exe = current_exe.with_extension("exe.old");
+             let _ = async_fs::rename(&current_exe, &old_exe).await;
+             
+             // Try to delete everything else
+             // remove_dir_all might fail on the dir itself if files are open
+             // We can spawn a cmd to delete it after delay
+             
+             let cmd_script = format!("timeout /t 2 /nobreak > NUL & rmdir /s /q \"{}\"", install_dir.display());
+             Command::new("cmd")
+                .arg("/C")
+                .arg(cmd_script)
+                .spawn()?;
+             
+             println!("Uninstall scheduled. Please exit the terminal.");
+             std::process::exit(0);
+        } else {
+             async_fs::remove_dir_all(&install_dir).await?;
+        }
+        println!("Removed .lunu directory.");
+    }
+
+    println!("Lunu uninstalled successfully.");
+    Ok(())
+}
+
+fn project_config_path(root: &Path) -> PathBuf {
+    root.join("lunu.toml")
+}
+
+fn lock_path(root: &Path) -> PathBuf {
+    root.join("lunu.lock")
+}
+
+fn current_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn resolve_lunu_root(root: &Path) -> PathBuf {
+    if root.join("config").join("settings.json").exists() {
+        return root.to_path_buf();
+    }
+    let lunu_sub = root.join("Lunu");
+    if lunu_sub.exists() && lunu_sub.is_dir() {
+        return lunu_sub;
+    }
+    root.to_path_buf()
+}
+
+fn project_name_from_root(root: &Path) -> String {
+    root.file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("lunu-project")
+        .to_string()
+}
+
+// --- Installer Logic ---
+
+fn is_installed() -> Result<bool> {
+    let home_dir = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+    let install_dir = home_dir.join(".lunu").join("bin");
+    let current_exe = std::env::current_exe()?;
+    
+    // Check if we are running from the install directory
+    Ok(current_exe.starts_with(&install_dir))
+}
+
+async fn install_self() -> Result<()> {
+    let home_dir = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+    let install_dir = home_dir.join(".lunu").join("bin");
+
+    println!("Lunu Installer v0.2.0 (Single Binary)");
+    println!("=====================================");
+    println!("Target: {:?}", install_dir);
+
+    // 1. Create Install Directory
+    if !install_dir.exists() {
+        println!("Creating install directory...");
+        async_fs::create_dir_all(&install_dir).await?;
+    }
+
+    // 2. Extract Binaries
+    println!("Extracting binaries...");
+    
+    // Copy Self (lunu.exe)
+    let current_exe = std::env::current_exe()?;
+    let target_lunu = install_dir.join("lunu.exe");
+    
+    println!("  Copying lunu.exe...");
+    async_fs::copy(&current_exe, &target_lunu).await?;
+
+    // 3. Setup PATH
+    println!("Setting up PATH...");
+    setup_path(&install_dir)?;
+
+    println!("\nInstallation Successful! 🎉");
+    println!("Please restart your terminal (or VS Code) for changes to take effect.");
+    println!("Try running: lunu --help");
+
+    // Pause before exit
+    print!("\nPress Enter to exit...");
+    std::io::stdout().flush()?;
+    let _ = std::io::stdin().read_line(&mut String::new());
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn setup_path(bin_dir: &Path) -> Result<()> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let env = hkcu.open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)?;
+    
+    let path_val: String = env.get_value("Path")?;
+    let bin_dir_str = bin_dir.to_str().unwrap();
+
+    // Normalize paths for comparison (remove trailing slashes, lowercase)
+    let normalized_path_val = path_val.to_lowercase();
+    let normalized_bin_dir = bin_dir_str.to_lowercase();
+
+    if !normalized_path_val.contains(&normalized_bin_dir) {
+        let new_path = if path_val.ends_with(';') {
+            format!("{}{}", path_val, bin_dir_str)
+        } else {
+            format!("{};{}", path_val, bin_dir_str)
+        };
+        env.set_value("Path", &new_path)?;
+        println!("Added to PATH.");
+    } else {
+        println!("Already in PATH.");
+    }
+    
+    // Broadcast setting change
+    use winapi::um::winuser::{SendMessageTimeoutA, HWND_BROADCAST, WM_SETTINGCHANGE, SMTO_ABORTIFHUNG};
+    use std::ptr;
+    use std::ffi::CString;
+
+    unsafe {
+        let env_str = CString::new("Environment").unwrap();
+        SendMessageTimeoutA(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            0,
+            env_str.as_ptr() as _,
+            SMTO_ABORTIFHUNG,
+            5000,
+            ptr::null_mut(),
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn setup_path(_bin_dir: &Path) -> Result<()> {
+    println!("Manual PATH configuration required for non-Windows systems.");
+    Ok(())
+}
+
+fn scan_modules(root: &Path) -> BTreeMap<String, DependencySpec> {
+    let mut deps = BTreeMap::new();
+    let modules_dir = root.join("modules");
+    if let Ok(read_dir) = std::fs::read_dir(modules_dir) {
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                    let mut spec = DependencySpec::default();
+                    spec.path = Some(format!("modules/{}", name));
+                    deps.insert(name.to_string(), spec);
+                }
+            }
+        }
+    }
+    deps
+}
+
+async fn load_or_init_project(root: &Path, config_path: &Path) -> Result<ProjectConfig> {
+    if config_path.exists() {
+        ProjectConfig::load(config_path).await
+    } else {
+        let name = project_name_from_root(root);
+        let cfg = ProjectConfig::new(&name);
+        cfg.save(config_path).await?;
+        Ok(cfg)
+    }
+}
+
+async fn ensure_project_files(root: &Path) -> Result<()> {
+    let src_dir = root.join("src");
+    let modules_dir = root.join("modules");
+    let config_dir = root.join("config");
+    
+    if !src_dir.exists() {
+        async_fs::create_dir_all(&src_dir).await?;
+    }
+    if !modules_dir.exists() {
+        async_fs::create_dir_all(&modules_dir).await?;
+    }
+    if !config_dir.exists() {
+        async_fs::create_dir_all(&config_dir).await?;
+    }
+
+    let main_path = src_dir.join("main.luau");
+    if !main_path.exists() {
+        async_fs::write(&main_path, "print(\"Hello from Lunu\")\n").await?;
+    }
+
+    let settings_path = config_dir.join("settings.json");
+    if !settings_path.exists() {
+        let default_settings = serde_json::json!({
+            "server": {
+                "host": "127.0.0.1",
+                "http_port": 8000,
+                "ssl_enabled": false,
+                "ssl_cert_path": "",
+                "ssl_key_path": ""
+            },
+            "security": {
+                "auth_enabled": true,
+                "allowed_hosts": ["127.0.0.1", "localhost"]
+            },
+            "logging": {
+                "level": "info",
+                "file": "logs/server.log"
+            }
+        });
+        async_fs::write(&settings_path, serde_json::to_string_pretty(&default_settings)?).await?;
+    }
+
+    Ok(())
+}
+
+async fn update_luaurc(root: &Path, deps: &BTreeMap<String, DependencySpec>) -> Result<()> {
+    let config_path = root.join(".luaurc");
+    let mut luaurc = Luaurc::load(&config_path).await?;
+    let lunu_alias = if root.join("Lunu").exists() {
+        "Lunu/".to_string()
+    } else if root.parent().map(|p| p.join("Lunu").exists()).unwrap_or(false) {
+        "../Lunu/".to_string()
+    } else {
+        "Lunu/".to_string()
+    };
+    luaurc.add_alias("lunu", &lunu_alias);
+    for (name, spec) in deps {
+        if let Some(path) = &spec.path {
+            let rel_path = path.trim_start_matches("./");
+            let rel_path_str = rel_path.replace("\\", "/") + "/";
+            luaurc.add_alias(name, &rel_path_str);
+        }
+    }
+    luaurc.save(&config_path).await?;
+    Ok(())
+}
+
+async fn init_project(root: &Path) -> Result<()> {
+    ensure_project_files(root).await?;
+    
+    // Install Lunu Core Library
+    let modules_dir = root.join("modules");
+    let lunu_mod_dir = modules_dir.join("lunu");
+    if !lunu_mod_dir.exists() {
+        async_fs::create_dir_all(&lunu_mod_dir).await?;
+        let init_content = include_str!("../../../init.luau");
+        async_fs::write(lunu_mod_dir.join("init.luau"), init_content).await?;
+        println!("Installed Lunu core library to modules/lunu");
+    }
+
+    let config_path = project_config_path(root);
+    let mut cfg = load_or_init_project(root, &config_path).await?;
+
+    let discovered = scan_modules(root);
+    for (name, spec) in discovered {
+        cfg.add_dependency(&name, spec);
+    }
+    
+    // Ensure lunu dependency is present
+    let mut lunu_spec = DependencySpec::default();
+    lunu_spec.path = Some("modules/lunu".to_string());
+    cfg.add_dependency("lunu", lunu_spec);
+
+    cfg.save(&config_path).await?;
+
+    update_luaurc(root, &cfg.dependencies).await?;
+    
+    // Explicitly add alias for @lunu
+    let luaurc_path = root.join(".luaurc");
+    let mut luaurc = Luaurc::load(&luaurc_path).await?;
+    luaurc.add_alias("lunu", "modules/lunu/");
+    luaurc.save(&luaurc_path).await?;
+
+    let lock_path = lock_path(root);
+    let mut lock = LockFile::load(&lock_path).await?;
+    let pm = PackageManager::new(root.to_path_buf());
+    for (name, spec) in &cfg.dependencies {
+        if let Some(path) = &spec.path {
+            let full_path = root.join(path);
+            if full_path.exists() {
+                let checksum = pm.calculate_dir_checksum(&full_path).await?;
+                lock.set(name, LockEntry {
+                    url: spec.url.clone(),
+                    version: spec.version.clone(),
+                    path: Some(path.clone()),
+                    checksum,
+                    installed_at: current_timestamp(),
+                });
+            }
+        }
+    }
+    lock.save(&lock_path).await?;
+
+    println!("Project initialized at {:?}", root);
+    Ok(())
+}
+
+async fn create_project(cwd: &Path, name: &str) -> Result<()> {
+    let project_dir = cwd.join(name);
+    if project_dir.exists() {
+        return Err(anyhow::anyhow!("Directory '{}' already exists", name));
+    }
+    async_fs::create_dir_all(&project_dir).await?;
+    init_project(&project_dir).await?;
+    Ok(())
+}
+
+async fn scaffold_project(cwd: &Path, name: &str, template: TemplateKind) -> Result<()> {
+    create_project(cwd, name).await?;
+    let project_dir = cwd.join(name);
+    let main_path = project_dir.join("src").join("main.luau");
+    let content = match template {
+        TemplateKind::App => "print(\"Hello from Lunu\")\n".to_string(),
+        TemplateKind::Game => {
+            [
+                "local frame = 0",
+                "while frame < 3 do",
+                "    print(\"tick\", frame)",
+                "    frame = frame + 1",
+                "end",
+                "",
+            ]
+            .join("\n")
+        }
+    };
+    async_fs::write(&main_path, content).await?;
+    println!("Scaffold created at {:?}", project_dir);
+    Ok(())
+}
+
+async fn create_module(root: &Path, name: &str, lang: ModuleLang) -> Result<()> {
+    let modules_dir = root.join("modules");
+    async_fs::create_dir_all(&modules_dir).await?;
+    let module_dir = modules_dir.join(name);
+    if module_dir.exists() {
+        return Err(anyhow::anyhow!("Module '{}' already exists", name));
+    }
+    async_fs::create_dir_all(&module_dir).await?;
+
+    let (worker_name, worker_content) = match lang {
+        ModuleLang::Python => (
+            "worker.py",
+            [
+                "import sys",
+                "import json",
+                "",
+                "def normalize_params(params):",
+                "    if len(params) == 1 and isinstance(params[0], list):",
+                "        return params[0]",
+                "    return params",
+                "",
+                "def handle(method, params):",
+                "    params = normalize_params(params)",
+                "    if method == \"greet\":",
+                "        name = params[0] if len(params) > 0 else \"\"",
+                "        return {\"result\": f\"Hello from Python, {name}!\"}",
+                "    if method == \"echo\":",
+                "        return {\"result\": params[0] if len(params) > 0 else None}",
+                "    return {\"error\": {\"code\": \"method_not_found\", \"message\": \"Method not found\"}}",
+                "",
+                "def main():",
+                "    while True:",
+                "        line = sys.stdin.readline()",
+                "        if line == \"\":",
+                "            break",
+                "        line = line.strip()",
+                "        if line == \"\":",
+                "            continue",
+                "        try:",
+                "            payload = json.loads(line)",
+                "        except Exception:",
+                "            continue",
+                "        request_id = payload.get(\"id\")",
+                "        method = payload.get(\"method\")",
+                "        params = payload.get(\"params\", [])",
+                "        if request_id is None or method is None:",
+                "            continue",
+                "        response = handle(method, params)",
+                "        response[\"id\"] = request_id",
+                "        sys.stdout.write(json.dumps(response) + \"\\n\")",
+                "        sys.stdout.flush()",
+                "",
+                "if __name__ == \"__main__\":",
+                "    main()",
+                "",
+            ]
+            .join("\n"),
+        ),
+        ModuleLang::Node => (
+            "worker.js",
+            [
+                "const readline = require('readline');",
+                "const rl = readline.createInterface({input: process.stdin, output: process.stdout});",
+                "",
+                "const normalizeParams = (params) => {",
+                "    if (Array.isArray(params) && params.length === 1 && Array.isArray(params[0])) {",
+                "        return params[0];",
+                "    }",
+                "    return params;",
+                "};",
+                "",
+                "const handle = (method, params) => {",
+                "    const normalized = normalizeParams(params || []);",
+                "    if (method === 'greet') {",
+                "        const name = normalized.length > 0 ? normalized[0] : '';",
+                "        return {result: `Hello from Node.js, ${name}!`};",
+                "    }",
+                "    if (method === 'echo') {",
+                "        return {result: normalized.length > 0 ? normalized[0] : null};",
+                "    }",
+                "    return {error: {code: 'method_not_found', message: 'Method not found'}};",
+                "};",
+                "",
+                "rl.on('line', (line) => {",
+                "    if (!line) return;",
+                "    const msg = JSON.parse(line);",
+                "    const response = {id: msg.id};",
+                "    if (!msg.method) {",
+                "        response.error = {code: 'invalid_request', message: 'Missing method'};",
+                "        console.log(JSON.stringify(response));",
+                "        return;",
+                "    }",
+                "    const result = handle(msg.method, msg.params || []);",
+                "    if (result.error) {",
+                "        response.error = result.error;",
+                "    } else {",
+                "        response.result = result.result;",
+                "    }",
+                "    console.log(JSON.stringify(response));",
+                "});",
+                "",
+            ]
+            .join("\n"),
+        ),
+    };
+
+    let worker_path = module_dir.join(worker_name);
+    async_fs::write(&worker_path, worker_content).await?;
+
+    let bridge_json = match lang {
+        ModuleLang::Python => serde_json::json!({
+            "protocol": "lunu-worker-v1",
+            "worker": { "cmd": ["python", worker_name], "cwd": ".", "env": {} },
+            "methods": { "greet": {}, "echo": {} }
+        }),
+        ModuleLang::Node => serde_json::json!({
+            "protocol": "lunu-worker-v1",
+            "worker": { "cmd": ["node", worker_name], "cwd": ".", "env": {} },
+            "methods": { "greet": {}, "echo": {} }
+        }),
+    };
+    let bridge_path = module_dir.join("bridge.json");
+    async_fs::write(&bridge_path, serde_json::to_string_pretty(&bridge_json)?).await?;
+    println!("Module created at {:?}", module_dir);
+    Ok(())
+}
+
+fn profile_script(root: &Path, script: &Path, runs: u32) -> Result<()> {
+    let lune = find_lune_executable(root).ok_or_else(|| anyhow::anyhow!("Lune runtime not found. Set LUNE_PATH or add to PATH."))?;
+    let mut durations = Vec::new();
+    for _ in 0..runs.max(1) {
+        let start = std::time::Instant::now();
+        let status = Command::new(&lune)
+            .arg("run")
+            .arg(script)
+            .current_dir(root)
+            .status()
+            .with_context(|| "Failed to run lune")?;
+        if !status.success() {
+            return Err(anyhow::anyhow!("Lune run failed"));
+        }
+        durations.push(start.elapsed());
+    }
+    let total_ms: u128 = durations.iter().map(|d| d.as_millis()).sum();
+    let avg_ms = total_ms as f64 / durations.len() as f64;
+    println!("Runs: {}", durations.len());
+    println!("Total: {} ms", total_ms);
+    println!("Average: {:.2} ms", avg_ms);
+    Ok(())
+}
+
+fn find_lune_executable(root: &Path) -> Option<PathBuf> {
+    let local = root.join("bin").join("lune.exe");
+    if local.exists() {
+        return Some(local);
+    }
+    if let Ok(path) = std::env::var("LUNE_PATH") {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    find_in_path("lune.exe")
+}
+
+fn find_in_path(binary: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    for path in std::env::split_paths(&paths) {
+        let candidate = path.join(binary);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+async fn install_from_config(root: &Path) -> Result<()> {
+    let config_path = project_config_path(root);
+    if !config_path.exists() {
+        return Err(anyhow::anyhow!("lunu.toml not found. Run 'lunu init' first."));
+    }
+    let cfg = ProjectConfig::load(&config_path).await?;
+    let mut lock = LockFile::load(&lock_path(root)).await?;
+    let pm = PackageManager::new(root.to_path_buf());
+
+    if cfg.dependencies.is_empty() {
+        println!("No dependencies listed in lunu.toml.");
+        return Ok(());
+    }
+
+    for (name, spec) in &cfg.dependencies {
+        if let Some(url) = &spec.url {
+            let (path, checksum) = pm.install_package(url, spec.version.as_deref(), name).await?;
+            CompatibilityLayer::ensure_compat(&path).await?;
+
+            let rel_path = pathdiff::diff_paths(&path, root).unwrap_or(path);
+            let rel_path_str = rel_path.to_string_lossy().replace("\\", "/");
+            lock.set(name, LockEntry {
+                url: Some(url.clone()),
+                version: spec.version.clone(),
+                path: Some(rel_path_str.clone()),
+                checksum,
+                installed_at: current_timestamp(),
+            });
+        } else if let Some(path) = &spec.path {
+            let full_path = root.join(path);
+            if full_path.exists() {
+                let checksum = pm.calculate_dir_checksum(&full_path).await?;
+                lock.set(name, LockEntry {
+                    url: None,
+                    version: spec.version.clone(),
+                    path: Some(path.clone()),
+                    checksum,
+                    installed_at: current_timestamp(),
+                });
+            }
+        }
+    }
+
+    update_luaurc(root, &cfg.dependencies).await?;
+    lock.save(&lock_path(root)).await?;
+    println!("Dependencies installed successfully.");
+    Ok(())
+}
+
+async fn remove_dependency(root: &Path, lib: &str) -> Result<()> {
+    let config_path = project_config_path(root);
+    if !config_path.exists() {
+        return Err(anyhow::anyhow!("lunu.toml not found. Run 'lunu init' first."));
+    }
+    let mut cfg = ProjectConfig::load(&config_path).await?;
+    cfg.remove_dependency(lib);
+    cfg.save(&config_path).await?;
+
+    let mut lock = LockFile::load(&lock_path(root)).await?;
+    lock.remove(lib);
+    lock.save(&lock_path(root)).await?;
+
+    let pm = PackageManager::new(root.to_path_buf());
+    pm.remove_package(lib).await?;
+
+    let luaurc_path = root.join(".luaurc");
+    let mut luaurc = Luaurc::load(&luaurc_path).await?;
+    luaurc.remove_alias(lib);
+    luaurc.save(&luaurc_path).await?;
+
+    println!("Removed dependency '{}'.", lib);
+    Ok(())
+}
+
+async fn update_dependencies(root: &Path, lib: Option<&str>) -> Result<()> {
+    let config_path = project_config_path(root);
+    if !config_path.exists() {
+        return Err(anyhow::anyhow!("lunu.toml not found. Run 'lunu init' first."));
+    }
+    let cfg = ProjectConfig::load(&config_path).await?;
+    let mut lock = LockFile::load(&lock_path(root)).await?;
+    let pm = PackageManager::new(root.to_path_buf());
+
+    let targets: Vec<(&String, &DependencySpec)> = cfg.dependencies.iter().collect();
+    for (name, spec) in targets {
+        if let Some(filter) = lib {
+            if name != filter {
+                continue;
+            }
+        }
+
+        if let Some(url) = &spec.url {
+            let (path, checksum) = pm.install_package(url, spec.version.as_deref(), name).await?;
+            CompatibilityLayer::ensure_compat(&path).await?;
+            let rel_path = pathdiff::diff_paths(&path, root).unwrap_or(path);
+            let rel_path_str = rel_path.to_string_lossy().replace("\\", "/");
+            lock.set(name, LockEntry {
+                url: Some(url.clone()),
+                version: spec.version.clone(),
+                path: Some(rel_path_str),
+                checksum,
+                installed_at: current_timestamp(),
+            });
+        }
+    }
+
+    lock.save(&lock_path(root)).await?;
+    println!("Dependencies updated.");
+    Ok(())
+}
+
+async fn list_dependencies(root: &Path) -> Result<()> {
+    let lock = LockFile::load(&lock_path(root)).await?;
+    if lock.dependencies.is_empty() {
+        println!("No dependencies installed.");
+        return Ok(());
+    }
+
+    for (name, entry) in lock.dependencies {
+        let source = entry.url.or(entry.path).unwrap_or_else(|| "unknown".to_string());
+        let version = entry.version.unwrap_or_else(|| "latest".to_string());
+        println!("{} | {} | {}", name, version, source);
+    }
+    Ok(())
+}
+
+async fn package_project(root: &Path) -> Result<()> {
+    let config_path = project_config_path(root);
+    if !config_path.exists() {
+        return Err(anyhow::anyhow!("lunu.toml not found. Run 'lunu init' first."));
+    }
+    let cfg = ProjectConfig::load(&config_path).await?;
+    let dist_dir = root.join("dist");
+    if dist_dir.exists() {
+        async_fs::remove_dir_all(&dist_dir).await?;
+    }
+    async_fs::create_dir_all(&dist_dir).await?;
+
+    let entry_path = PathBuf::from(&cfg.project.entry);
+    let stem = entry_path.file_stem().and_then(|s| s.to_str()).unwrap_or("main");
+    let exe_path = root.join(format!("{}.exe", stem));
+    if exe_path.exists() {
+        async_fs::copy(&exe_path, dist_dir.join(exe_path.file_name().unwrap())).await?;
+    } else {
+        println!("Warning: executable not found at {:?}", exe_path);
+    }
+
+    let modules_dir = root.join("modules");
+    if modules_dir.exists() {
+        let mut options = CopyOptions::new();
+        options.copy_inside = true;
+        copy_dir(&modules_dir, dist_dir.join("modules"), &options)?;
+    }
+
+    let assets_dir = root.join("assets");
+    if assets_dir.exists() {
+        let mut options = CopyOptions::new();
+        options.copy_inside = true;
+        copy_dir(&assets_dir, dist_dir.join("assets"), &options)?;
+    }
+
+    let lock_path = lock_path(root);
+    if lock_path.exists() {
+        async_fs::copy(&lock_path, dist_dir.join("lunu.lock")).await?;
+    }
+    async_fs::copy(&config_path, dist_dir.join("lunu.toml")).await?;
+
+    println!("Package created at {:?}", dist_dir);
+    Ok(())
+}
+
+
+async fn check_environment(root: &Path) -> Result<()> {
+    let lunu_root = resolve_lunu_root(root);
+    let config_path = project_config_path(root);
+    let lock_path = lock_path(root);
+    let modules_dir = root.join("modules");
+    let src_main = root.join("src").join("main.luau");
+    let builder_exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("lunu-builder.exe")))
+        .unwrap_or_else(|| root.join("bin").join("lunu-builder.exe"));
+
+    println!("Environment check:");
+    println!("- Lunu directory: {}", lunu_root.exists());
+    println!("- Project config (lunu.toml): {}", config_path.exists());
+    println!("- Lock file (lunu.lock): {}", lock_path.exists());
+    println!("- Modules directory: {}", modules_dir.exists());
+    println!("- Entry file: {}", src_main.exists());
+    println!("- Builder executable: {}", builder_exe.exists());
+    Ok(())
+}
+
+fn find_root(start: &std::path::Path) -> Option<PathBuf> {
+    let mut current = start.to_path_buf();
+    loop {
+        if current.join(".luaurc").exists() {
+            return Some(current);
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn project_name_from_root_works() {
+        let dir = tempdir().unwrap();
+        let name = project_name_from_root(dir.path());
+        assert!(!name.is_empty());
+    }
+
+    #[test]
+    fn scan_modules_detects_dirs() {
+        let dir = tempdir().unwrap();
+        let modules_dir = dir.path().join("modules");
+        std::fs::create_dir_all(modules_dir.join("demo")).unwrap();
+        let deps = scan_modules(dir.path());
+        assert!(deps.contains_key("demo"));
+    }
+
+    #[tokio::test]
+    async fn init_project_creates_core_files() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        init_project(root).await.unwrap();
+
+        assert!(root.join("lunu.toml").exists());
+        assert!(root.join("lunu.lock").exists());
+        assert!(root.join(".luaurc").exists());
+        assert!(root.join("modules").join("lunu").join("init.luau").exists());
+        assert!(root.join("src").join("main.luau").exists());
+        assert!(root.join("config").join("settings.json").exists());
+    }
+
+    #[tokio::test]
+    async fn package_project_creates_dist_bundle() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        init_project(root).await.unwrap();
+        std::fs::write(root.join("main.exe"), "stub").unwrap();
+
+        package_project(root).await.unwrap();
+
+        let dist = root.join("dist");
+        assert!(dist.exists());
+        assert!(dist.join("main.exe").exists());
+        assert!(dist.join("lunu.toml").exists());
+    }
+}

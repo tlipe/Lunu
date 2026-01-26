@@ -1,0 +1,4 @@
+[dependencies.lunu]
+path = "modules/lunu"
+checksum = "096b0b7ed509d7b5b213640922c1040733f287d4b6f1ea9cce2c0d9a86e65014"
+installed_at = 1769444587
