@@ -72,7 +72,7 @@ The Bridge is a tooling integration layer. It starts external workers only when 
 - `lunu install` - Install dependencies from `lunu.toml`.
 - `lunu update [name]` - Update dependencies.
 - `lunu list` - List installed dependencies.
-- `lunu build <entry.luau>` - Build a standalone executable.
+- `lunu build <entry.luau>` - Create a standalone executable with brute optimization in C
 - `lunu package` - Create a distributable bundle.
 - `lunu check` - Validate project environment.
 - `lunu dev` - Start the HTTP bridge server in the foreground.
