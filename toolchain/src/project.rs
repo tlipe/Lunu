@@ -23,6 +23,33 @@ pub struct ProjectConfig {
     pub project: ProjectInfo,
     #[serde(default)]
     pub dependencies: BTreeMap<String, DependencySpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<BuildConfig>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RuntimeConfig {
+    pub name: String,
+    pub engine: String,
+    pub security: String,
+    pub performance: String,
+    pub notes: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct BuildConfig {
+    pub kind: String,
+    pub link: String,
+    pub modules: String,
+    #[serde(default)]
+    pub module_languages: Vec<String>,
+    #[serde(default)]
+    pub features: Vec<String>,
+    pub c_compiler: Option<String>,
+    pub cpp_compiler: Option<String>,
+    pub toolchain: Option<String>,
 }
 
 impl ProjectConfig {
@@ -34,6 +61,21 @@ impl ProjectConfig {
                 modules_dir: "modules".to_string(),
             },
             dependencies: BTreeMap::new(),
+            runtime: None,
+            build: None,
+        }
+    }
+
+    pub fn new_with_runtime(name: &str, runtime: RuntimeConfig, build: Option<BuildConfig>) -> Self {
+        Self {
+            project: ProjectInfo {
+                name: name.to_string(),
+                entry: "src/main.luau".to_string(),
+                modules_dir: "modules".to_string(),
+            },
+            dependencies: BTreeMap::new(),
+            runtime: Some(runtime),
+            build,
         }
     }
 

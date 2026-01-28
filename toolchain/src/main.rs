@@ -11,22 +11,29 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::process::Command;
+use std::fs::{self, File};
 use anyhow::{Result, Context};
 use config::Luaurc;
 use github::GithubClient;
 use package::PackageManager;
 use compat::CompatibilityLayer;
-use project::{ProjectConfig, DependencySpec};
+use project::{ProjectConfig, DependencySpec, RuntimeConfig, BuildConfig};
 use lock::{LockFile, LockEntry};
 use fs_extra::dir::{copy as copy_dir, CopyOptions};
 use serde_json::Value;
 use tokio::fs as async_fs;
 
-use std::io::Write;
+use std::io::{self, Write};
 #[cfg(windows)]
 use winreg::enums::*;
 #[cfg(windows)]
 use winreg::RegKey;
+#[cfg(windows)]
+use winapi::um::consoleapi::GetConsoleMode;
+#[cfg(windows)]
+use winapi::um::processenv::GetStdHandle;
+#[cfg(windows)]
+use winapi::um::winbase::STD_INPUT_HANDLE;
 
 
 #[derive(Parser)]
@@ -128,6 +135,11 @@ enum Commands {
         #[arg(short, long, default_value_t = 1)]
         runs: u32,
     },
+    Run {
+        script: PathBuf,
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(ValueEnum, Clone)]
@@ -140,6 +152,230 @@ enum TemplateKind {
 enum ModuleLang {
     Python,
     Node,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuntimeKind {
+    Lute,
+    Lune,
+}
+
+impl RuntimeKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            RuntimeKind::Lute => "lute",
+            RuntimeKind::Lune => "lune",
+        }
+    }
+}
+
+struct ToolchainDetection {
+    c_compiler: Option<PathBuf>,
+    cpp_compiler: Option<PathBuf>,
+    toolchain: Option<String>,
+}
+
+fn stdin_is_interactive() -> bool {
+    #[cfg(windows)]
+    {
+        unsafe {
+            let handle = GetStdHandle(STD_INPUT_HANDLE);
+            if handle.is_null() {
+                return false;
+            }
+            let mut mode = 0u32;
+            GetConsoleMode(handle, &mut mode) != 0
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
+fn runtime_from_env() -> Option<RuntimeKind> {
+    for key in ["LUNU_RUNTIME", "LUNU_INIT_RUNTIME"] {
+        if let Ok(value) = std::env::var(key) {
+            let v = value.trim().to_lowercase();
+            if v == "lute" || v == "c++" || v == "cpp" {
+                return Some(RuntimeKind::Lute);
+            }
+            if v == "lune" || v == "rust" {
+                return Some(RuntimeKind::Lune);
+            }
+        }
+    }
+    None
+}
+
+fn select_runtime() -> Result<RuntimeKind> {
+    if let Some(runtime) = runtime_from_env() {
+        return Ok(runtime);
+    }
+    if !stdin_is_interactive() {
+        return Ok(RuntimeKind::Lune);
+    }
+
+    println!("Select a runtime for this project:");
+    println!("1) C++ - Lute");
+    println!("   Security: full system access, no sandboxing, maximum flexibility");
+    println!("   Performance: highest, direct native execution and module integration");
+    println!("   Libraries: @lute and @std are available by default");
+    println!("2) Rust - Lune");
+    println!("   Security: sandboxed and safer defaults with bridge boundaries");
+    println!("   Performance: great for tooling, bridge calls add overhead");
+    println!("   Libraries: @lune is used for bridge-driven integrations");
+    print!("Choose [1-2] (default 2): ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let choice = input.trim().to_lowercase();
+    if choice.is_empty() || choice == "2" || choice == "lune" {
+        return Ok(RuntimeKind::Lune);
+    }
+    if choice == "1" || choice == "lute" {
+        return Ok(RuntimeKind::Lute);
+    }
+
+    loop {
+        print!("Please enter 1 (Lute) or 2 (Lune): ");
+        io::stdout().flush()?;
+        input.clear();
+        io::stdin().read_line(&mut input)?;
+        let value = input.trim().to_lowercase();
+        if value == "1" || value == "lute" {
+            return Ok(RuntimeKind::Lute);
+        }
+        if value == "2" || value == "lune" {
+            return Ok(RuntimeKind::Lune);
+        }
+    }
+}
+
+fn runtime_config_for(runtime: RuntimeKind) -> RuntimeConfig {
+    match runtime {
+        RuntimeKind::Lute => RuntimeConfig {
+            name: "lute".to_string(),
+            engine: "C++".to_string(),
+            security: "Full system access, no sandboxing, maximum flexibility".to_string(),
+            performance: "Highest performance with direct native execution".to_string(),
+            notes: "Use @lute and @std, build native modules directly (C/C++/Rust)".to_string(),
+        },
+        RuntimeKind::Lune => RuntimeConfig {
+            name: "lune".to_string(),
+            engine: "Rust".to_string(),
+            security: "Sandboxed defaults with bridge isolation".to_string(),
+            performance: "Great for tooling; bridge calls add overhead".to_string(),
+            notes: "Bridge-based integration for external languages".to_string(),
+        },
+    }
+}
+
+fn runtime_kind_from_config(cfg: &ProjectConfig) -> RuntimeKind {
+    match cfg.runtime.as_ref().map(|r| r.name.as_str()) {
+        Some("lute") => RuntimeKind::Lute,
+        _ => RuntimeKind::Lune,
+    }
+}
+
+async fn resolve_runtime_for_root(root: &Path) -> Result<RuntimeKind> {
+    if let Some(runtime) = runtime_from_env() {
+        return Ok(runtime);
+    }
+    let config_path = project_config_path(root);
+    if config_path.exists() {
+        if let Ok(cfg) = ProjectConfig::load(&config_path).await {
+            return Ok(runtime_kind_from_config(&cfg));
+        }
+    }
+    Ok(RuntimeKind::Lune)
+}
+
+fn build_config_for(runtime: RuntimeKind, toolchain: Option<ToolchainDetection>) -> BuildConfig {
+    match runtime {
+        RuntimeKind::Lute => {
+            let toolchain = toolchain.unwrap_or(ToolchainDetection {
+                c_compiler: None,
+                cpp_compiler: None,
+                toolchain: None,
+            });
+            BuildConfig {
+                kind: "native".to_string(),
+                link: "direct".to_string(),
+                modules: "native".to_string(),
+                module_languages: vec!["c".to_string(), "cpp".to_string(), "rust".to_string()],
+                features: vec![
+                    "std".to_string(),
+                    "lute".to_string(),
+                    "direct-build".to_string(),
+                ],
+                c_compiler: toolchain
+                    .c_compiler
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string()),
+                cpp_compiler: toolchain
+                    .cpp_compiler
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string()),
+                toolchain: toolchain.toolchain,
+            }
+        }
+        RuntimeKind::Lune => BuildConfig {
+            kind: "bridge".to_string(),
+            link: "http-bridge".to_string(),
+            modules: "bridge".to_string(),
+            module_languages: vec![],
+            features: vec![
+                "sandboxed".to_string(),
+                "bridge-workers".to_string(),
+            ],
+            c_compiler: None,
+            cpp_compiler: None,
+            toolchain: None,
+        },
+    }
+}
+
+fn detect_cpp_toolchain() -> ToolchainDetection {
+    let cpp_candidates = [
+        ("cl.exe", "msvc"),
+        ("clang-cl.exe", "clang-cl"),
+        ("clang++.exe", "clang"),
+        ("g++.exe", "gcc"),
+    ];
+    let c_candidates = [
+        ("cl.exe", "msvc"),
+        ("clang-cl.exe", "clang-cl"),
+        ("clang.exe", "clang"),
+        ("gcc.exe", "gcc"),
+    ];
+
+    let mut toolchain = None;
+    let mut cpp_compiler = None;
+    for (bin, kind) in cpp_candidates {
+        if let Some(path) = find_in_path(bin) {
+            cpp_compiler = Some(path);
+            toolchain = Some(kind.to_string());
+            break;
+        }
+    }
+    let mut c_compiler = None;
+    for (bin, kind) in c_candidates {
+        if let Some(path) = find_in_path(bin) {
+            c_compiler = Some(path);
+            if toolchain.is_none() {
+                toolchain = Some(kind.to_string());
+            }
+            break;
+        }
+    }
+
+    ToolchainDetection {
+        c_compiler,
+        cpp_compiler,
+        toolchain,
+    }
 }
 
 #[tokio::main]
@@ -201,8 +437,15 @@ async fn main() -> Result<()> {
             bridge_server::run().await?;
         },
         Some(Commands::Build { script, output, force, open, icon, open_cmd }) => {
-            // Internal Builder
-            lunu_builder::build_executable(&script, output, force, open, icon, open_cmd, None)?;
+            let runtime = resolve_runtime_for_root(&root).await?;
+            match runtime {
+                RuntimeKind::Lute => {
+                    build_with_lute(&root, &script, output, open, &icon, &open_cmd)?;
+                }
+                RuntimeKind::Lune => {
+                    lunu_builder::build_executable(&script, output, force, open, icon, open_cmd, None)?;
+                }
+            }
         },
         Some(Commands::Scaffold { name, template }) => {
             scaffold_project(&cwd, &name, template).await?;
@@ -212,6 +455,10 @@ async fn main() -> Result<()> {
         },
         Some(Commands::Profile { script, runs }) => {
             profile_script(&root, &script, runs)?;
+        },
+        Some(Commands::Run { script, args }) => {
+            let runtime = resolve_runtime_for_root(&root).await?;
+            run_script(&root, &script, &args, runtime)?;
         },
         Some(Commands::Add { query, alias }) => {
             println!("Searching for '{}'...", query);
@@ -254,7 +501,9 @@ async fn main() -> Result<()> {
             println!("Updated .luaurc with alias '{}'", install_name);
 
             let config_path = project_config_path(&root);
-            let mut proj = load_or_init_project(&root, &config_path).await?;
+            let runtime = resolve_runtime_for_root(&root).await?;
+            let build_cfg = Some(build_config_for(runtime, None));
+            let mut proj = load_or_init_project(&root, &config_path, runtime, build_cfg).await?;
             let mut spec = DependencySpec::default();
             spec.url = Some(target.url.clone());
             spec.path = Some(rel_path_str.trim_end_matches('/').to_string());
@@ -365,8 +614,6 @@ async fn self_uninstall() -> Result<()> {
         // Self-deletion check
         let current_exe = std::env::current_exe()?;
         if current_exe.starts_with(&install_dir) {
-             let temp_exe = std::env::temp_dir().join(format!("lunu_uninstall_{}.exe", std::process::id()));
-             
              // Copy self to temp to finish uninstallation
              // Actually, we can just schedule deletion on reboot or use a batch script
              // But simpler: just rename self and try to delete dir, ignoring self error
@@ -548,21 +795,53 @@ fn scan_modules(root: &Path) -> BTreeMap<String, DependencySpec> {
     deps
 }
 
-async fn load_or_init_project(root: &Path, config_path: &Path) -> Result<ProjectConfig> {
-    if config_path.exists() {
-        ProjectConfig::load(config_path).await
+async fn load_or_init_project(
+    root: &Path,
+    config_path: &Path,
+    runtime: RuntimeKind,
+    build: Option<BuildConfig>,
+) -> Result<ProjectConfig> {
+    let mut cfg = if config_path.exists() {
+        ProjectConfig::load(config_path).await?
     } else {
         let name = project_name_from_root(root);
-        let cfg = ProjectConfig::new(&name);
+        let cfg = ProjectConfig::new_with_runtime(name.as_str(), runtime_config_for(runtime), build.clone());
         cfg.save(config_path).await?;
-        Ok(cfg)
+        cfg
+    };
+
+    if cfg.runtime.is_none() {
+        cfg.runtime = Some(runtime_config_for(runtime));
+    }
+    if cfg.build.is_none() {
+        cfg.build = build;
+    }
+
+    Ok(cfg)
+}
+
+fn main_template(runtime: RuntimeKind) -> String {
+    match runtime {
+        RuntimeKind::Lute => [
+            "local process = require(\"@lute/process\")",
+            "local path = require(\"@std/path\")",
+            "",
+            "print(\"Hello from Lute\")",
+            "print(\"cwd:\", process.cwd())",
+            "print(\"exe:\", process.execpath())",
+            "",
+        ]
+        .join("\n"),
+        RuntimeKind::Lune => "print(\"Hello from Lunu\")\n".to_string(),
     }
 }
 
-async fn ensure_project_files(root: &Path) -> Result<()> {
+async fn ensure_project_files(root: &Path, runtime: RuntimeKind) -> Result<()> {
     let src_dir = root.join("src");
     let modules_dir = root.join("modules");
     let config_dir = root.join("config");
+    let native_dir = root.join("native");
+    let build_dir = root.join("build");
     
     if !src_dir.exists() {
         async_fs::create_dir_all(&src_dir).await?;
@@ -573,10 +852,18 @@ async fn ensure_project_files(root: &Path) -> Result<()> {
     if !config_dir.exists() {
         async_fs::create_dir_all(&config_dir).await?;
     }
+    if runtime == RuntimeKind::Lute {
+        if !native_dir.exists() {
+            async_fs::create_dir_all(&native_dir).await?;
+        }
+        if !build_dir.exists() {
+            async_fs::create_dir_all(&build_dir).await?;
+        }
+    }
 
     let main_path = src_dir.join("main.luau");
     if !main_path.exists() {
-        async_fs::write(&main_path, "print(\"Hello from Lunu\")\n").await?;
+        async_fs::write(&main_path, main_template(runtime)).await?;
     }
 
     let settings_path = config_dir.join("settings.json");
@@ -604,17 +891,19 @@ async fn ensure_project_files(root: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn update_luaurc(root: &Path, deps: &BTreeMap<String, DependencySpec>) -> Result<()> {
+async fn update_luaurc(root: &Path, deps: &BTreeMap<String, DependencySpec>, runtime: RuntimeKind) -> Result<()> {
     let config_path = root.join(".luaurc");
     let mut luaurc = Luaurc::load(&config_path).await?;
-    let lunu_alias = if root.join("Lunu").exists() {
-        "Lunu/".to_string()
-    } else if root.parent().map(|p| p.join("Lunu").exists()).unwrap_or(false) {
-        "../Lunu/".to_string()
-    } else {
-        "Lunu/".to_string()
-    };
-    luaurc.add_alias("lunu", &lunu_alias);
+    if runtime == RuntimeKind::Lune {
+        let lunu_alias = if root.join("Lunu").exists() {
+            "Lunu/".to_string()
+        } else if root.parent().map(|p| p.join("Lunu").exists()).unwrap_or(false) {
+            "../Lunu/".to_string()
+        } else {
+            "Lunu/".to_string()
+        };
+        luaurc.add_alias("lunu", &lunu_alias);
+    }
     for (name, spec) in deps {
         if let Some(path) = &spec.path {
             let rel_path = path.trim_start_matches("./");
@@ -627,40 +916,58 @@ async fn update_luaurc(root: &Path, deps: &BTreeMap<String, DependencySpec>) -> 
 }
 
 async fn init_project(root: &Path) -> Result<()> {
-    ensure_project_files(root).await?;
+    let runtime = select_runtime()?;
+    let toolchain = if runtime == RuntimeKind::Lute {
+        if find_lute_executable(root).is_none() {
+            return Err(anyhow::anyhow!("Lute runtime not found. Set LUTE_PATH, place bin/lute.exe in the project, or add lute.exe to PATH."));
+        }
+        let detection = detect_cpp_toolchain();
+        if detection.c_compiler.is_none() || detection.cpp_compiler.is_none() {
+            return Err(anyhow::anyhow!("C/C++ compiler not found. Install MSVC Build Tools, clang, or gcc and ensure cl.exe/clang++.exe/g++.exe is on PATH."));
+        }
+        Some(detection)
+    } else {
+        None
+    };
+
+    let build_cfg = Some(build_config_for(runtime, toolchain));
+    ensure_project_files(root, runtime).await?;
     
-    // Install Lunu Core Library
-    let modules_dir = root.join("modules");
-    let lunu_mod_dir = modules_dir.join("lunu");
-    if !lunu_mod_dir.exists() {
-        async_fs::create_dir_all(&lunu_mod_dir).await?;
-        let init_content = include_str!("../../../init.luau");
-        async_fs::write(lunu_mod_dir.join("init.luau"), init_content).await?;
-        println!("Installed Lunu core library to modules/lunu");
+    if runtime == RuntimeKind::Lune {
+        let modules_dir = root.join("modules");
+        let lunu_mod_dir = modules_dir.join("lunu");
+        if !lunu_mod_dir.exists() {
+            async_fs::create_dir_all(&lunu_mod_dir).await?;
+            let init_content = include_str!("../../../init.luau");
+            async_fs::write(lunu_mod_dir.join("init.luau"), init_content).await?;
+            println!("Installed Lunu core library to modules/lunu");
+        }
     }
 
     let config_path = project_config_path(root);
-    let mut cfg = load_or_init_project(root, &config_path).await?;
+    let mut cfg = load_or_init_project(root, &config_path, runtime, build_cfg).await?;
 
     let discovered = scan_modules(root);
     for (name, spec) in discovered {
         cfg.add_dependency(&name, spec);
     }
     
-    // Ensure lunu dependency is present
-    let mut lunu_spec = DependencySpec::default();
-    lunu_spec.path = Some("modules/lunu".to_string());
-    cfg.add_dependency("lunu", lunu_spec);
+    if runtime == RuntimeKind::Lune {
+        let mut lunu_spec = DependencySpec::default();
+        lunu_spec.path = Some("modules/lunu".to_string());
+        cfg.add_dependency("lunu", lunu_spec);
+    }
 
     cfg.save(&config_path).await?;
 
-    update_luaurc(root, &cfg.dependencies).await?;
+    update_luaurc(root, &cfg.dependencies, runtime).await?;
     
-    // Explicitly add alias for @lunu
-    let luaurc_path = root.join(".luaurc");
-    let mut luaurc = Luaurc::load(&luaurc_path).await?;
-    luaurc.add_alias("lunu", "modules/lunu/");
-    luaurc.save(&luaurc_path).await?;
+    if runtime == RuntimeKind::Lune {
+        let luaurc_path = root.join(".luaurc");
+        let mut luaurc = Luaurc::load(&luaurc_path).await?;
+        luaurc.add_alias("lunu", "modules/lunu/");
+        luaurc.save(&luaurc_path).await?;
+    }
 
     let lock_path = lock_path(root);
     let mut lock = LockFile::load(&lock_path).await?;
@@ -699,6 +1006,15 @@ async fn create_project(cwd: &Path, name: &str) -> Result<()> {
 async fn scaffold_project(cwd: &Path, name: &str, template: TemplateKind) -> Result<()> {
     create_project(cwd, name).await?;
     let project_dir = cwd.join(name);
+    let config_path = project_config_path(&project_dir);
+    if config_path.exists() {
+        if let Ok(cfg) = ProjectConfig::load(&config_path).await {
+            if cfg.runtime.as_ref().map(|r| r.name.as_str()) == Some("lute") {
+                println!("Scaffold created at {:?}", project_dir);
+                return Ok(());
+            }
+        }
+    }
     let main_path = project_dir.join("src").join("main.luau");
     let content = match template {
         TemplateKind::App => "print(\"Hello from Lunu\")\n".to_string(),
@@ -884,6 +1200,35 @@ fn find_lune_executable(root: &Path) -> Option<PathBuf> {
     find_in_path("lune.exe")
 }
 
+fn find_lute_executable(root: &Path) -> Option<PathBuf> {
+    let local = root.join("bin").join("lute.exe");
+    if local.exists() {
+        return Some(local);
+    }
+    if let Ok(path) = std::env::var("LUTE_PATH") {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if let Some(p) = find_in_path("lute.exe") {
+        return Some(p);
+    }
+    let tmp = std::env::temp_dir().join("lunu_runtime").join("lute.exe");
+    if !tmp.exists() {
+        if let Some(bytes) = embedded_lute_bytes() {
+            let _ = fs::create_dir_all(tmp.parent().unwrap());
+            if let Ok(mut f) = File::create(&tmp) {
+                let _ = f.write_all(bytes);
+            }
+        }
+    }
+    if tmp.exists() {
+        return Some(tmp);
+    }
+    None
+}
+
 fn find_in_path(binary: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     for path in std::env::split_paths(&paths) {
@@ -893,6 +1238,85 @@ fn find_in_path(binary: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn embedded_lute_bytes() -> Option<&'static [u8]> {
+    Some(include_bytes!("../resources/lute.exe"))
+}
+
+fn run_script(root: &Path, script: &Path, args: &[String], runtime: RuntimeKind) -> Result<()> {
+    if !script.exists() {
+        return Err(anyhow::anyhow!(format!("Input script not found: {:?}", script)));
+    }
+    let status = match runtime {
+        RuntimeKind::Lute => {
+            let lute = find_lute_executable(root).ok_or_else(|| anyhow::anyhow!("Lute runtime not found. Set LUTE_PATH, place bin/lute.exe in the project, or add lute.exe to PATH."))?;
+            Command::new(&lute)
+                .arg("run")
+                .arg(script)
+                .args(args)
+                .current_dir(root)
+                .status()
+                .with_context(|| "Failed to run lute")?
+        }
+        RuntimeKind::Lune => {
+            let lune = find_lune_executable(root).ok_or_else(|| anyhow::anyhow!("Lune runtime not found. Set LUNE_PATH or add to PATH."))?;
+            Command::new(&lune)
+                .arg("run")
+                .arg(script)
+                .args(args)
+                .current_dir(root)
+                .status()
+                .with_context(|| "Failed to run lune")?
+        }
+    };
+    if !status.success() {
+        return Err(anyhow::anyhow!("Script execution failed"));
+    }
+    Ok(())
+}
+
+fn build_with_lute(
+    root: &Path,
+    script: &Path,
+    output: Option<PathBuf>,
+    open: bool,
+    _icon: &Option<PathBuf>,
+    _open_cmd: &Option<bool>,
+) -> Result<()> {
+    let lute = find_lute_executable(root).ok_or_else(|| anyhow::anyhow!("Lute runtime not found. Set LUTE_PATH, place bin/lute.exe in the project, or add lute.exe to PATH."))?;
+    if !script.exists() {
+        return Err(anyhow::anyhow!(format!("Input script not found: {:?}", script)));
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| root.to_path_buf());
+    let default_out = {
+        let stem = script.file_stem().unwrap_or_default();
+        let mut p = cwd.join(stem);
+        p.set_extension("exe");
+        p
+    };
+    let out_path = output.clone().unwrap_or(default_out);
+    let status = Command::new(&lute)
+        .arg("compile")
+        .arg(script)
+        .arg("--output")
+        .arg(&out_path)
+        .current_dir(root)
+        .status()
+        .with_context(|| "Failed to run lute compile")?;
+    if !status.success() {
+        return Err(anyhow::anyhow!("Lute compile failed"));
+    }
+    if open {
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("explorer")
+                .arg("/select,")
+                .arg(&out_path)
+                .spawn();
+        }
+    }
+    Ok(())
 }
 
 async fn install_from_config(root: &Path) -> Result<()> {
@@ -938,7 +1362,7 @@ async fn install_from_config(root: &Path) -> Result<()> {
         }
     }
 
-    update_luaurc(root, &cfg.dependencies).await?;
+    update_luaurc(root, &cfg.dependencies, runtime_kind_from_config(&cfg)).await?;
     lock.save(&lock_path(root)).await?;
     println!("Dependencies installed successfully.");
     Ok(())
@@ -1085,6 +1509,41 @@ async fn check_environment(root: &Path) -> Result<()> {
     println!("- Modules directory: {}", modules_dir.exists());
     println!("- Entry file: {}", src_main.exists());
     println!("- Builder executable: {}", builder_exe.exists());
+
+    if config_path.exists() {
+        if let Ok(cfg) = ProjectConfig::load(&config_path).await {
+            if let Some(runtime) = cfg.runtime {
+                println!("- Runtime: {} ({})", runtime.name, runtime.engine);
+                if runtime.name == "lute" {
+                    let lute = find_lute_executable(root);
+                    let toolchain = detect_cpp_toolchain();
+                    let c_found = toolchain.c_compiler.is_some();
+                    let cpp_found = toolchain.cpp_compiler.is_some();
+                    println!("- Lute executable: {}", lute.is_some());
+                    println!("- C compiler: {}", c_found);
+                    println!("- C++ compiler: {}", cpp_found);
+                    let entry = root.join(&cfg.project.entry);
+                    if !entry.exists() {
+                        return Err(anyhow::anyhow!("Entry file not found for Lute check: {:?}", entry));
+                    }
+                    let lute = lute.ok_or_else(|| anyhow::anyhow!("Lute runtime not found. Set LUTE_PATH, place bin/lute.exe in the project, or add lute.exe to PATH."))?;
+                    let status = Command::new(&lute)
+                        .arg("check")
+                        .arg(&entry)
+                        .current_dir(root)
+                        .status()
+                        .with_context(|| "Failed to run lute check")?;
+                    if !status.success() {
+                        return Err(anyhow::anyhow!("Lute check failed"));
+                    }
+                }
+                if runtime.name == "lune" {
+                    let lune_found = find_lune_executable(root).is_some();
+                    println!("- Lune executable: {}", lune_found);
+                }
+            }
+        }
+    }
     Ok(())
 }
 

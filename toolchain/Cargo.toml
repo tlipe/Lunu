@@ -6,7 +6,7 @@ authors = ["Lunu Toolchain"]
 description = "Robust library management toolchain for Lunu"
 
 [dependencies]
-winapi = { version = "0.3", features = ["winuser"] }
+winapi = { version = "0.3", features = ["winuser", "consoleapi", "processenv", "winbase"] }
 tokio = { version = "1.36", features = ["full"] }
 reqwest = { version = "0.11", features = ["json", "rustls-tls", "gzip", "brotli"] }
 serde = { version = "1.0", features = ["derive"] }

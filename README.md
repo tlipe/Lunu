@@ -1,15 +1,16 @@
 # Lunu
 
-**Lunu** is a robust toolchain and library manager for **Luau** (powered by the **Lune** runtime). It provides a complete set of tools to develop, manage dependencies, and compile Luau projects into standalone native executables.
+**Lunu** is a robust toolchain and library manager for **Luau** powered by **Lute** (native) and **Lune** (bridge). It provides a complete set of tools to develop, manage dependencies, and compile Luau projects into standalone native executables.
 
 Made in Rust 🦀
 
 ## Features
 
 - **Dependency Management**: Easily install, update, and remove libraries (similar to `npm` or `cargo`).
+- **Lute Runtime**: Native execution with `@lute` and `@std`, plus direct native module support (C/C++/Rust).
 - **Build System**: Compile your Luau scripts (`.luau`) into native executables (`.exe`) that run on any Windows machine. **The builder is built-in**, so you don't need external tools.
-- **Bridge Runtime**: Direct stdin/stdout worker execution for Python, Node.js, Rust, and more.
-- **Single-File Distribution**: The entire toolchain (Manager, Builder, Bridge) is contained in a **single executable** (`lunu.exe`).
+- **Lune Runtime**: Bridge runtime with direct stdin/stdout worker execution for Python, Node.js, Rust, and more.
+- **Single-File Distribution**: The entire toolchain (Manager, Builder, Bridge, and Lute runtime) is contained in a **single executable** (`lunu.exe`).
 
 ---
 
@@ -47,15 +48,75 @@ lunu add user/repo
 lunu remove lib-name
 ```
 
-### 3. Compiling to Executable (.exe)
+### 3. Running Scripts
+Run your script using the runtime configured for the project:
+
+```bash
+lunu run src/main.luau
+```
+
+### 4. Compiling to Executable (.exe)
 Turn your main script into a standalone program:
 
 ```bash
 lunu build main.luau
 ```
-This will generate a `main.exe` file in the same folder. This executable contains the Lune runtime, your dependencies, and your script, all embedded.
+This will generate a `main.exe` file in the same folder. For Lute projects, it uses `lute compile` and bundles native modules directly. For Lune projects, the executable embeds the Lune runtime, your dependencies, and your script.
+ 
+ ### Lute Runtime (Native)
+ 
+ - Native C++ execution with @lute and @std, no sandbox.
+ - Direct native modules (C/C++/Rust) without bridge overhead.
+ 
+Requirements
+- Lute is embedded in lunu.exe and extracted to a temp runtime cache on demand.
+- Optional override: set LUTE_PATH to use a custom Lute build.
+- C/C++ toolchain installed and on PATH (MSVC cl.exe, clang++, or g++).
+ 
+ Selecting Lute
+ - Interactive: run lunu init and choose “C++ - Lute”.
+ - Non-interactive:
+ 
+ ```bash
+ # Initialize a Lute project
+ LUNU_INIT_RUNTIME=lute lunu init
+ 
+ # Force Lute when running on CI
+ LUNU_RUNTIME=lute lunu run src/main.luau
+ ```
+ 
+ Lute Commands via Lunu
+ 
+ ```bash
+ # Type check entry script with Lute
+ lunu check
+ 
+ # Run with Lute
+ lunu run src/main.luau --arg1 value
+ 
+ # Build native executable with Lute
+ lunu build src/main.luau -o app.exe --open
+ ```
+ 
+ Runtime Resolution Order
+ - Environment: LUNU_RUNTIME or LUNU_INIT_RUNTIME (lute|lune) has priority.
+ - Project config: lunu.toml runtime.name.
+ - Default: Lune when not specified.
+ 
+ Example lunu.toml runtime section
+ 
+ ```toml
+ [runtime]
+ name = "lute"
+ engine = "C++"
+ ```
+ 
+Troubleshooting (Lute)
+- “Lute runtime not found”: set LUTE_PATH or check temp runtime cache permissions.
+ - “C/C++ compiler not found”: install MSVC Build Tools, clang, or gcc; ensure cl.exe/clang++.exe/g++.exe is on PATH.
+ - “Entry file not found”: check project.entry in lunu.toml and ensure the script exists.
 
-### 4. Bridge Runtime
+### 5. Bridge Runtime
 The Bridge is a tooling integration layer. It starts external workers only when a bridge call happens and exchanges data over stdin/stdout for that call. This path is for build, analysis, lint, debug, hot reload, and optional integrations. It is not part of the gameplay/runtime-critical loop, not an engine execution path, and not a replacement for FFI. For advanced debugging and tooling, use `lunu dev` to start the HTTP server in the foreground.
 
 **Foreground Benefits**
@@ -74,7 +135,8 @@ The Bridge is a tooling integration layer. It starts external workers only when 
 - `lunu list` - List installed dependencies.
 - `lunu build <entry.luau>` - Create a standalone executable with brute optimization in C
 - `lunu package` - Create a distributable bundle.
-- `lunu check` - Validate project environment.
+- `lunu run <entry.luau> [args...]` - Run a script using the project runtime.
+- `lunu check` - Validate project environment and run Lute type checks when applicable.
 - `lunu dev` - Start the HTTP bridge server in the foreground.
 - `lunu scaffold <name> --template <app|game>` - Scaffold a new project.
 - `lunu module <name> --lang <python|node>` - Create a bridge module scaffold.

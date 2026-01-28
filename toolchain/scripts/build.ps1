@@ -8,6 +8,12 @@ if (-not (Get-Command "cargo" -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
+$LutePayload = "$PSScriptRoot\..\resources\lute.exe"
+if (-not (Test-Path $LutePayload)) {
+    Write-Error "Embedded Lute runtime not found at $LutePayload. Place lute.exe there before building."
+    exit 1
+}
+
 $BinDir = "$PSScriptRoot\..\..\bin"
 if (-not (Test-Path $BinDir)) {
     New-Item -ItemType Directory -Path $BinDir | Out-Null

@@ -6,6 +6,7 @@ fn cli_init_creates_project_layout() {
     let dir = tempdir().unwrap();
     let status = Command::new(env!("CARGO_BIN_EXE_lunu"))
         .arg("init")
+        .env("LUNU_INIT_RUNTIME", "lune")
         .current_dir(dir.path())
         .status()
         .unwrap();
@@ -20,6 +21,7 @@ fn cli_check_runs_on_initialized_project() {
     let dir = tempdir().unwrap();
     let status = Command::new(env!("CARGO_BIN_EXE_lunu"))
         .arg("init")
+        .env("LUNU_INIT_RUNTIME", "lune")
         .current_dir(dir.path())
         .status()
         .unwrap();
