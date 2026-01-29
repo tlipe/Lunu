@@ -14,7 +14,7 @@ pub fn build_executable(
     open: bool,
     icon: Option<PathBuf>,
     open_cmd: Option<bool>,
-    _bridge_bytes: Option<&[u8]>,
+    custom_runtime_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     println!("Lunu Builder v0.1.2 (Internal)");
     println!("-------------------------------");
@@ -71,13 +71,18 @@ pub fn build_executable(
         if !settings_path.exists() {
             return Err(anyhow::anyhow!("Config not found at {:?}. Run 'lunu init' in the project directory.", settings_path));
         }
-        let lune_path = resolve_lune_path(&project_root)?;
+        let lune_path = if let Some(p) = custom_runtime_path {
+            p
+        } else {
+            resolve_lune_path(&project_root)?
+        };
         if !lune_path.exists() {
             return Err(anyhow::anyhow!("Lune runtime not found at {:?}.", lune_path));
         }
 
         let mut zip_writer = zip::ZipWriter::new(std::io::Cursor::new(&mut base_zip_buffer));
-        let options = FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        // Use Deflated (compression) instead of Stored to reduce binary size significantly
+        let options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
         zip_writer.start_file("bin/lune.exe", options)?;
         let mut lune_content = Vec::new();
@@ -102,7 +107,7 @@ pub fn build_executable(
 
         let init_path = project_root.join("init.luau");
         if init_path.exists() {
-            let options = FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            let options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
             zip_writer.start_file("Lunu/init.luau", options)?;
             let mut content = Vec::new();
             File::open(&init_path)?.read_to_end(&mut content)?;
@@ -114,7 +119,7 @@ pub fn build_executable(
 
         let luaurc_path = project_root.join(".luaurc");
         if luaurc_path.exists() {
-            let options = FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            let options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
             zip_writer.start_file(".luaurc", options)?;
             let mut content = Vec::new();
             File::open(&luaurc_path)?.read_to_end(&mut content)?;
@@ -138,7 +143,7 @@ pub fn build_executable(
     
     let file = fs::OpenOptions::new().read(true).write(true).open(&temp_zip_path)?;
     let mut zip_writer = zip::ZipWriter::new_append(file)?;
-    let options = FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
     zip_writer.start_file("src/main.luau", options)?;
     let mut script_content = Vec::new();
@@ -375,10 +380,10 @@ fn find_in_path(binary: &str) -> Option<PathBuf> {
     None
 }
 
-fn add_dir_to_zip<W: Write + io::Seek>(
+fn add_dir_to_zip<W: Write + std::io::Seek>(
     zip: &mut zip::ZipWriter<W>,
     src_dir: &Path,
-    prefix: &str,
+    dst_dir: &str,
     options: FileOptions,
 ) -> anyhow::Result<()> {
     if !src_dir.exists() {
@@ -389,18 +394,25 @@ fn add_dir_to_zip<W: Write + io::Seek>(
         let entry = entry?;
         let path = entry.path();
         
-        if path.is_dir() {
+        // Filter out unnecessary files
+        if path.components().any(|c| {
+            let s = c.as_os_str().to_string_lossy();
+            s == "target" || s == ".git" || s == "node_modules" || s == "__pycache__"
+        }) {
             continue;
         }
 
-        let rel_path = path.strip_prefix(src_dir)?;
-        let zip_path = Path::new(prefix).join(rel_path);
-        let zip_path_str = zip_path.to_string_lossy().replace("\\", "/");
+        let name = path.strip_prefix(src_dir)?;
+        let path_str = name.to_string_lossy().replace("\\", "/");
+        let zip_path = format!("{}/{}", dst_dir, path_str);
 
-        zip.start_file(zip_path_str, options)?;
-        let mut content = Vec::new();
-        File::open(path)?.read_to_end(&mut content)?;
-        zip.write_all(&content)?;
+        if path.is_file() {
+            zip.start_file(zip_path, options)?;
+            let mut f = File::open(path)?;
+            let mut buffer = Vec::new();
+            f.read_to_end(&mut buffer)?;
+            zip.write_all(&buffer)?;
+        }
     }
     Ok(())
 }

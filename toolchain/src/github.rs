@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use reqwest::Client;
 use anyhow::{Result, anyhow};
 
@@ -23,9 +23,6 @@ struct RepositoryNode {
     name: String,
     owner: Owner,
     url: String,
-    description: Option<String>,
-    #[serde(rename = "defaultBranchRef")]
-    default_branch_ref: Option<BranchRef>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -33,18 +30,11 @@ struct Owner {
     login: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct BranchRef {
-    name: String,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PackageInfo {
     pub owner: String,
     pub name: String,
     pub url: String,
-    pub description: String,
-    pub default_branch: String,
 }
 
 pub struct GithubClient {
@@ -83,8 +73,6 @@ impl GithubClient {
                         name
                         owner { login }
                         url
-                        description
-                        defaultBranchRef { name }
                     }
                 }
             }
@@ -120,8 +108,6 @@ impl GithubClient {
             owner: node.owner.login,
             name: node.name,
             url: node.url,
-            description: node.description.unwrap_or_default(),
-            default_branch: node.default_branch_ref.map(|b| b.name).unwrap_or_else(|| "main".to_string()),
         }).collect();
 
         Ok(packages)
@@ -132,12 +118,10 @@ impl GithubClient {
         #[derive(Deserialize)]
         struct RestSearch { items: Vec<RestRepo> }
         #[derive(Deserialize)]
-        struct RestRepo { 
+        struct RestRepo {
             name: String, 
             owner: Owner, 
-            html_url: String, 
-            description: Option<String>, 
-            default_branch: String 
+            html_url: String
         }
 
         let res = self.client.get("https://api.github.com/search/repositories")
@@ -151,8 +135,6 @@ impl GithubClient {
             owner: item.owner.login,
             name: item.name,
             url: item.html_url,
-            description: item.description.unwrap_or_default(),
-            default_branch: item.default_branch,
         }).collect())
     }
 }

@@ -1119,6 +1119,7 @@ dependencies = [
  "tracing-subscriber",
  "winapi",
  "winreg 0.55.0",
+ "zip",
 ]
 
 [[package]]

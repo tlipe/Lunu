@@ -28,8 +28,8 @@ struct ServerConfig {
     host: String,
     http_port: u16,
     ssl_enabled: bool,
-    ssl_cert_path: String,
-    ssl_key_path: String,
+    _ssl_cert_path: String,
+    _ssl_key_path: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -60,7 +60,7 @@ struct Secrets {
 struct AppState {
     config: Config,
     secrets: Secrets,
-    base_dir: PathBuf,
+    _base_dir: PathBuf,
     modules_dir: PathBuf,
     workers: Mutex<HashMap<String, Arc<WorkerHandle>>>,
 }
@@ -86,7 +86,7 @@ where
 
 #[derive(Deserialize)]
 struct BridgeConfig {
-    protocol: Option<String>,
+    _protocol: Option<String>,
     worker: WorkerSpec,
     methods: HashMap<String, MethodSpec>,
 }
@@ -97,10 +97,8 @@ struct WorkerSpec {
     cwd: Option<String>,
     env: Option<HashMap<String, String>>,
     timeout_ms: Option<u64>,
-    idle_timeout_ms: Option<u64>,
-}
-
-#[derive(Deserialize)]
+    _idle_timeout_ms: Option<u64>,
+}#[derive(Deserialize)]
 struct MethodSpec {
     timeout_ms: Option<u64>,
 }
@@ -113,7 +111,7 @@ struct WorkerHandle {
 
 #[derive(Clone)]
 struct WorkerError {
-    code: String,
+    _code: String,
     message: String,
 }
 
@@ -141,7 +139,7 @@ pub async fn run() -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         config,
         secrets,
-        base_dir,
+        _base_dir: base_dir,
         modules_dir,
         workers: Mutex::new(HashMap::new()),
     });
@@ -465,7 +463,7 @@ async fn start_worker(module_dir: &PathBuf, spec: &WorkerSpec) -> Result<Arc<Wor
         reader_handle.alive.store(false, Ordering::SeqCst);
         let mut pending = reader_handle.pending.lock().await;
         for (_, tx) in pending.drain() {
-            let _ = tx.send(Err(WorkerError { code: "worker_closed".to_string(), message: "Worker closed".to_string() }));
+            let _ = tx.send(Err(WorkerError { _code: "worker_closed".to_string(), message: "Worker closed".to_string() }));
         }
     });
 
@@ -497,7 +495,7 @@ fn parse_worker_response(value: Value) -> Result<Value, WorkerError> {
     if let Some(err) = value.get("error") {
         let code = err.get("code").and_then(|v| v.as_str()).unwrap_or("worker_error");
         let message = err.get("message").and_then(|v| v.as_str()).unwrap_or("Worker error");
-        return Err(WorkerError { code: code.to_string(), message: message.to_string() });
+        return Err(WorkerError { _code: code.to_string(), message: message.to_string() });
     }
     Ok(value.get("result").cloned().unwrap_or(Value::Null))
 }

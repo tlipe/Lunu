@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use anyhow::Result;
 use tokio::fs;
 
@@ -38,7 +38,8 @@ impl CompatibilityLayer {
             if let Some(ext) = p.extension() {
                 if ext == "luau" || ext == "lua" {
                     if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                        export_lines.push(format!("    {} = require(\"./{}\"),", stem, stem));
+                        // Use string interpolation in generated Luau code
+                        export_lines.push(format!("    {} = require(`./{}`),", stem, stem));
                     }
                 }
             }

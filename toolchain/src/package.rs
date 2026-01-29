@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
-use git2::{Repository, FetchOptions, build::RepoBuilder};
-use anyhow::{Result, Context, anyhow};
+use git2::{FetchOptions, build::RepoBuilder};
+use anyhow::Result;
 use tokio::fs;
 use sha2::{Sha256, Digest};
 use path_clean::PathClean;
@@ -14,7 +14,7 @@ impl PackageManager {
         Self { root_dir }
     }
 
-    pub async fn install_package(&self, url: &str, version: Option<&str>, target_name: &str) -> Result<(PathBuf, String)> {
+    pub async fn install_package(&self, url: &str, _version: Option<&str>, target_name: &str) -> Result<(PathBuf, String)> {
         // 1. Prepare Paths
         let install_path = self.root_dir.join("modules").join(target_name).clean();
         
@@ -54,15 +54,6 @@ impl PackageManager {
         }
 
         Ok((install_path, checksum))
-    }
-
-    pub async fn clean_global_venv(&self) -> Result<()> {
-        let venv = self.root_dir.join(".venv");
-        if venv.exists() {
-            println!("Cleaning global .venv at {:?}", venv);
-            fs::remove_dir_all(venv).await?;
-        }
-        Ok(())
     }
 
     pub async fn remove_package(&self, name: &str) -> Result<()> {
@@ -117,16 +108,5 @@ mod tests {
         assert_ne!(first, third);
     }
 
-    #[tokio::test]
-    async fn clean_global_venv_removes_folder() {
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-        let venv = root.join(".venv");
-        fs::create_dir_all(&venv).await.unwrap();
-        fs::write(venv.join("file.txt"), "x").await.unwrap();
-
-        let pm = PackageManager::new(root.to_path_buf());
-        pm.clean_global_venv().await.unwrap();
-        assert!(!venv.exists());
-    }
+    
 }

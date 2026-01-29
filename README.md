@@ -7,10 +7,23 @@ Made in Rust 🦀
 ## Features
 
 - **Dependency Management**: Easily install, update, and remove libraries (similar to `npm` or `cargo`).
-- **Lute Runtime**: Native execution with `@lute` and `@std`, plus direct native module support (C/C++/Rust).
+- **Lute Runtime**: Native execution with `@lute` and `@std`, plus direct native module support (C/C++/Rust) without bridge overhead.
 - **Build System**: Compile your Luau scripts (`.luau`) into native executables (`.exe`) that run on any Windows machine. **The builder is built-in**, so you don't need external tools.
 - **Lune Runtime**: Bridge runtime with direct stdin/stdout worker execution for Python, Node.js, Rust, and more.
 - **Single-File Distribution**: The entire toolchain (Manager, Builder, Bridge, and Lute runtime) is contained in a **single executable** (`lunu.exe`).
+
+---
+
+## Tech Stack
+
+Lunu is built using a modern and high-performance stack:
+
+*   **Core**: Rust (using `tokio` for async I/O, `clap` for CLI, `reqwest` for networking).
+*   **Scripting Language**: Luau (type-safe, highly performant Lua derivative).
+*   **Runtimes**:
+    *   **Lune**: A standalone Luau runtime with file system and process access, used for tooling and bridge integrations.
+    *   **Lute**: A high-performance native runtime that allows direct linking with C/C++ libraries.
+*   **Serialization**: Serde (Rust) and `serde_json` / `@lune/serde` for robust data exchange.
 
 ---
 
@@ -48,274 +61,94 @@ lunu add user/repo
 lunu remove lib-name
 ```
 
-### 3. Running Scripts
-Run your script using the runtime configured for the project:
+### 3. Selecting a Runtime
+
+Lunu supports multiple runtimes for different use cases. You can configure this in `lunu.toml` or override it via environment variables.
+
+*   **Lune (Default)**: Best for scripting, tooling, and projects requiring Python/Node.js integration via Bridge.
+*   **Lute (Native)**: Best for performance-critical applications, games, and native modules (C++/Rust).
+
+**Configuration (`lunu.toml`):**
+```toml
+[runtime]
+name = "lute"  # or "lune"
+```
+
+**CLI Override:**
+```bash
+# Run with Lute explicitly
+LUNU_RUNTIME=lute lunu run src/main.luau
+```
+
+### 4. Running Scripts
+Run your script using the configured runtime:
 
 ```bash
 lunu run src/main.luau
 ```
 
-### 4. Compiling to Executable (.exe)
+### 5. Compiling to Executable (.exe)
 Turn your main script into a standalone program:
 
 ```bash
 lunu build main.luau
 ```
-This will generate a `main.exe` file in the same folder. For Lute projects, it uses `lute compile` and bundles native modules directly. For Lune projects, the executable embeds the Lune runtime, your dependencies, and your script.
- 
- ### Lute Runtime (Native)
- 
- - Native C++ execution with @lute and @std, no sandbox.
- - Direct native modules (C/C++/Rust) without bridge overhead.
- 
-Requirements
-- Lute is embedded in lunu.exe and extracted to a temp runtime cache on demand.
-- Optional override: set LUTE_PATH to use a custom Lute build.
-- C/C++ toolchain installed and on PATH (MSVC cl.exe, clang++, or g++).
- 
- Selecting Lute
- - Interactive: run lunu init and choose “C++ - Lute”.
- - Non-interactive:
- 
- ```bash
- # Initialize a Lute project
- LUNU_INIT_RUNTIME=lute lunu init
- 
- # Force Lute when running on CI
- LUNU_RUNTIME=lute lunu run src/main.luau
- ```
- 
- Lute Commands via Lunu
- 
- ```bash
- # Type check entry script with Lute
- lunu check
- 
- # Run with Lute
- lunu run src/main.luau --arg1 value
- 
- # Build native executable with Lute
- lunu build src/main.luau -o app.exe --open
- ```
- 
- Runtime Resolution Order
- - Environment: LUNU_RUNTIME or LUNU_INIT_RUNTIME (lute|lune) has priority.
- - Project config: lunu.toml runtime.name.
- - Default: Lune when not specified.
- 
- Example lunu.toml runtime section
- 
- ```toml
- [runtime]
- name = "lute"
- engine = "C++"
- ```
- 
-Troubleshooting (Lute)
-- “Lute runtime not found”: set LUTE_PATH or check temp runtime cache permissions.
- - “C/C++ compiler not found”: install MSVC Build Tools, clang, or gcc; ensure cl.exe/clang++.exe/g++.exe is on PATH.
- - “Entry file not found”: check project.entry in lunu.toml and ensure the script exists.
+*   **Lune Projects**: Embeds the Lune runtime, dependencies, and script into a single `.exe`.
+*   **Lute Projects**: Compiles using the native C++ toolchain, linking directly against `@lute` and native modules.
 
-### 5. Bridge Runtime
-The Bridge is a tooling integration layer. It starts external workers only when a bridge call happens and exchanges data over stdin/stdout for that call. This path is for build, analysis, lint, debug, hot reload, and optional integrations. It is not part of the gameplay/runtime-critical loop, not an engine execution path, and not a replacement for FFI. For advanced debugging and tooling, use `lunu dev` to start the HTTP server in the foreground.
+---
 
-**Foreground Benefits**
-- **Software development**: fast iteration, predictable logs, and simpler local setup.
-- **Game development**: deterministic startup, easier profiling, and fewer background conflicts.
-- **Tooling & automation**: portable executions in CI, clean teardown per call, and fewer environment dependencies.
+## Polyglot Development: Lute vs. Lune
 
-### CLI Reference
+Lunu empowers you to connect Luau with other languages, but the approach depends on your chosen runtime.
 
-- `lunu init` - Initialize a project in the current directory.
-- `lunu create <name>` - Create and initialize a new project folder.
-- `lunu add <user/repo>` - Add a dependency from GitHub.
+### Lune (The Bridge Approach)
+**Best for**: Python, Node.js, or safe/sandboxed environments.
+
+Lune uses a **Bridge System** where external workers (Python scripts, Node.js apps, etc.) run in separate processes and communicate via JSON-RPC over Stdin/Stdout.
+
+*   **Pros**: Safe (sandboxed), language-agnostic (works with anything that speaks JSON), easy to distribute Python scripts.
+*   **Cons**: Serialization overhead, async communication only.
+
+**Example (Python):**
+```lua
+local lunu = require("@lunu")
+local result = lunu.call("my-python-lib", "greet", "User")
+print(`Result: {result}`)
+```
+
+### Lute (The Native Approach)
+**Best for**: C++, Rust, High-Performance Systems.
+
+Lute allows **direct native modules**. You can write C++ or Rust code that compiles into libraries linked directly to your application.
+
+*   **Pros**: Zero overhead (direct function calls), full system access, maximum performance.
+*   **Cons**: Requires a C++ compiler (MSVC/Clang/GCC) installed on the dev machine.
+
+**Example (Native C++):**
+In Lute, you don't need a bridge. You simply `require` the native module, and it works as if it were Luau code.
+
+---
+
+## CLI Reference
+
+- `lunu init` - Initialize a project.
+- `lunu create <name>` - Create a new project folder.
+- `lunu add <user/repo>` - Add a dependency.
 - `lunu remove <name>` - Remove a dependency.
 - `lunu install` - Install dependencies from `lunu.toml`.
-- `lunu update [name]` - Update dependencies.
-- `lunu list` - List installed dependencies.
-- `lunu build <entry.luau>` - Create a standalone executable with brute optimization in C
-- `lunu package` - Create a distributable bundle.
-- `lunu run <entry.luau> [args...]` - Run a script using the project runtime.
-- `lunu check` - Validate project environment and run Lute type checks when applicable.
-- `lunu dev` - Start the HTTP bridge server in the foreground.
-- `lunu scaffold <name> --template <app|game>` - Scaffold a new project.
-- `lunu module <name> --lang <python|node>` - Create a bridge module scaffold.
-- `lunu profile <script> --runs <n>` - Profile a script with Lune.
+- `lunu build <entry.luau>` - Compile to executable.
+- `lunu run <entry.luau> [args...]` - Run a script.
+- `lunu check` - Validate environment and types.
+- `lunu dev` - Start HTTP bridge server (foreground).
+- `lunu scaffold <name> --template <app|game>` - Scaffold a project.
+- `lunu module <name> --lang <python|node|rust>` - Create a module scaffold.
+- `lunu runtime <lute|lune> [--update]` - Manage runtimes.
+- `lunu runtimes [--update]` - Manage all runtimes.
 - `lunu upgrade` - Upgrade the CLI.
 - `lunu uninstall` - Uninstall the CLI.
 
 ---
-
-## Polyglot Development (Connecting External Languages)
-
-Lunu allows you to extend your Luau applications with **any language** (Python, Rust, C++, Node.js) using the **Bridge System**.
-
-### How it works
-1. You create a module in the `modules/` directory.
-2. You define a `bridge.json` file mapping function names to system commands.
-3. Your Luau script calls these functions via the Lunu Bridge API.
-4. **Communication**: On a bridge call, the worker is spawned and JSON-RPC is exchanged via **Standard Input/Output (stdin/stdout)** for that call.
-
-The Bridge is a dev/tooling path, not a runtime-critical execution path.
-
-### Example: Connecting Python
-
-1. Create a folder `modules/my-python-lib`.
-2. Create your Python script `worker.py` inside it. It must read JSON from stdin and write JSON to stdout:
-   ```python
-   import sys
-   import json
-
-   def normalize_params(params):
-       if len(params) == 1 and isinstance(params[0], list):
-           return params[0]
-       return params
-
-   def handle(method, params):
-       params = normalize_params(params)
-       if method == "greet":
-           name = params[0] if len(params) > 0 else ""
-           return {"result": f"Hello from Python, {name}!"}
-       return {"error": {"code": "404", "message": "Method not found"}}
-
-   def main():
-       while True:
-           line = sys.stdin.readline()
-           if not line: break
-           
-           msg = json.loads(line)
-           req_id = msg.get("id")
-           method = msg.get("method")
-           params = msg.get("params", [])
-           
-           response = {"id": req_id}
-           response.update(handle(method, params))
-               
-           print(json.dumps(response))
-           sys.stdout.flush()
-
-   if __name__ == "__main__":
-       main()
-   ```
-3. Create a `bridge.json` file in the same folder:
-   ```json
-   {
-     "worker": {
-       "cmd": ["python", "worker.py"],
-       "timeout_ms": 5000
-     },
-     "methods": {
-       "greet": {"timeout_ms": 1000}
-     }
-   }
-   ```
-4. In your Luau code (`init.luau`):
-   ```lua
-   local lunu = require("@lunu")
-   
-   -- Calls 'greet' command in 'my-python-lib' module
-   local result = lunu.call("my-python-lib", "greet", "Lunu User")
-   print(result) -- Output: Hello from Python, Lunu User!
-   ```
-
----
-
-### Example: Connecting Node.js
-
-1. Create a folder `modules/my-node-lib`.
-2. Create your JavaScript file `worker.js` inside it:
-   ```javascript
-   const readline = require('readline');
-   const rl = readline.createInterface({input: process.stdin, output: process.stdout});
-
-   rl.on('line', (line) => {
-       if (!line) return;
-       const msg = JSON.parse(line);
-       const response = {id: msg.id};
-
-       if (msg.method === 'greet') {
-       response.result = `Hello from Node.js, ${msg.params[0]}!`;
-       } else {
-           response.error = {code: '404', message: 'Not found'};
-       }
-       console.log(JSON.stringify(response));
-   });
-   ```
-3. Create a `bridge.json` file:
-   ```json
-   {
-     "worker": {"cmd": ["node", "worker.js"]},
-     "methods": {"greet": {}}
-   }
-   ```
-
----
-
-### 5. CLI Utilities
-
-Project scaffolding:
-
-```bash
-lunu scaffold my-app --template app
-lunu scaffold my-game --template game
-```
-
-Bridge module scaffolding:
-
-```bash
-lunu module my-python-lib --lang python
-lunu module my-node-lib --lang node
-```
-
-Lightweight profiling:
-
-```bash
-lunu profile src/main.luau --runs 5
-```
-
-## Builder Optimizations & Binary Size
-
-Lunu Builder now includes advanced optimizations to produce the smallest possible executables.
-
-### Size Comparison (Benchmark)
-
-| Implementation | Binary Size (Stub) | Reduction |
-|----------------|-------------------|-----------|
-| **Legacy Rust** | ~950 KB           | 0%        |
-| **Optimized Rust** (Current) | ~304 KB | **~68%** |
-| **Experimental C** | < 50 KB | ~95% |
-
-### Optimized Rust Stub (Default)
-The default builder uses a highly optimized Rust implementation (`opt-level='z'`, `lto=true`, `panic='abort'`, `strip=true`). This delivers a ~300KB stub overhead, which is negligible for most applications compared to the Lune runtime size.
-
-### Experimental C Stub
-For users demanding absolute minimal size, a C implementation is available in `builder/src/stub.c`.
-To use it:
-1. Compile `stub.c` using GCC/MSVC to `lunu-stub.exe`.
-2. Replace the embedded stub in the toolchain or manually place it in `bin/lunu-stub.exe`.
-See `builder/BUILD_C.md` for details.
-
----
-
-## Security & Performance
-
-### `toolchain/`
-The "brain" of Lunu. Contains the **Rust** source code for:
-- **CLI (`lunu-cli`)**: The main command-line tool.
-- **Bridge**: The HTTP server.
-- **Builder Integration**: The builder logic is now embedded directly into the CLI.
-
-### `builder/`
-The compilation system source code. It is compiled as a library and embedded into the main `lunu` binary.
-
-### Bridge Runtime
-The Bridge runs inside the runtime and spawns workers per call.
-- **Security**:
-  - **Path Validation**: Workers run only within the module or allowed paths.
-  - **Isolation**: Each call starts its own process.
-- **Performance**:
-  - **Zero-Copy**: Lightweight stdin/stdout communication.
-  - **Simplicity**: Fewer moving parts and a smaller operational footprint.
 
 ## License
 

@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::process::Command;
 use std::fs::{self, File};
+use reqwest::header::USER_AGENT;
 use anyhow::{Result, Context};
 use config::Luaurc;
 use github::GithubClient;
@@ -38,7 +39,7 @@ use winapi::um::winbase::STD_INPUT_HANDLE;
 
 #[derive(Parser)]
 #[command(name = "lunu")]
-#[command(version = "0.0.1")]
+#[command(version = "0.1.1")]
 #[command(about = "Lunu Toolchain Manager", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -135,11 +136,35 @@ enum Commands {
         #[arg(short, long, default_value_t = 1)]
         runs: u32,
     },
+    /// Run a script using the project runtime (Lute or Lune) resolved from config/env
     Run {
+        /// The entry point script (e.g., src/main.luau)
         script: PathBuf,
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
+    /// Run project tests (*.test.luau, *.spec.luau)
+    Test {
+        /// Specific test file to run (optional)
+        #[arg(short, long)]
+        file: Option<PathBuf>,
+    },
+    /// Manage a specific runtime
+    Runtime {
+        #[arg(value_enum)]
+        runtime: RuntimeTarget,
+        /// Update the runtime from the official GitHub release
+        #[arg(long)]
+        update: bool,
+    },
+    /// Manage all runtimes
+    Runtimes {
+        /// Update all runtimes from official GitHub releases
+        #[arg(long)]
+        update: bool,
+    },
+    /// Clean internal cache
+    Clean,
 }
 
 #[derive(ValueEnum, Clone)]
@@ -152,6 +177,13 @@ enum TemplateKind {
 enum ModuleLang {
     Python,
     Node,
+    Rust,
+}
+
+#[derive(ValueEnum, Clone, Copy)]
+enum RuntimeTarget {
+    Lute,
+    Lune,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -160,14 +192,11 @@ enum RuntimeKind {
     Lune,
 }
 
-impl RuntimeKind {
-    fn as_str(&self) -> &'static str {
-        match self {
-            RuntimeKind::Lute => "lute",
-            RuntimeKind::Lune => "lune",
-        }
-    }
-}
+
+
+const LUTE_REPO: &str = "luau-lang/lute";
+const LUNE_REPO: &str = "lune-org/lune";
+const LUTE_EMBEDDED_VERSION: &str = "0.1.0";
 
 struct ToolchainDetection {
     c_compiler: Option<PathBuf>,
@@ -206,6 +235,253 @@ fn runtime_from_env() -> Option<RuntimeKind> {
         }
     }
     None
+}
+
+#[derive(serde::Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    assets: Vec<GithubAsset>,
+}
+
+#[derive(serde::Deserialize, Clone)]
+struct GithubAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RuntimeMeta {
+    version: String,
+    source: String,
+}
+
+struct RuntimeUpdate {
+    version: String,
+    url: String,
+}
+
+fn runtime_target_from_kind(kind: RuntimeKind) -> RuntimeTarget {
+    match kind {
+        RuntimeKind::Lute => RuntimeTarget::Lute,
+        RuntimeKind::Lune => RuntimeTarget::Lune,
+    }
+}
+
+fn runtime_repo(target: RuntimeTarget) -> &'static str {
+    match target {
+        RuntimeTarget::Lute => LUTE_REPO,
+        RuntimeTarget::Lune => LUNE_REPO,
+    }
+}
+
+fn runtime_name(target: RuntimeTarget) -> &'static str {
+    match target {
+        RuntimeTarget::Lute => "lute",
+        RuntimeTarget::Lune => "lune",
+    }
+}
+
+fn runtime_cache_dir() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| std::env::temp_dir())
+        .join("lunu")
+        .join("runtimes")
+}
+
+fn runtime_cache_bin(target: RuntimeTarget) -> PathBuf {
+    runtime_cache_dir().join(format!("{}.exe", runtime_name(target)))
+}
+
+fn runtime_meta_path(target: RuntimeTarget) -> PathBuf {
+    runtime_cache_dir().join(format!("{}.json", runtime_name(target)))
+}
+
+fn read_runtime_meta(target: RuntimeTarget) -> Option<RuntimeMeta> {
+    let path = runtime_meta_path(target);
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn write_runtime_meta(target: RuntimeTarget, meta: &RuntimeMeta) -> Result<()> {
+    let path = runtime_meta_path(target);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let content = serde_json::to_string(meta)?;
+    std::fs::write(path, content)?;
+    Ok(())
+}
+
+fn ensure_embedded_lute() -> Option<PathBuf> {
+    let target = RuntimeTarget::Lute;
+    let path = runtime_cache_bin(target);
+    if path.exists() {
+        return Some(path);
+    }
+    if let Some(bytes) = embedded_lute_bytes() {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(mut f) = File::create(&path) {
+            let _ = f.write_all(bytes);
+        }
+        if path.exists() {
+            if read_runtime_meta(target).is_none() {
+                let _ = write_runtime_meta(
+                    target,
+                    &RuntimeMeta {
+                        version: LUTE_EMBEDDED_VERSION.to_string(),
+                        source: "embedded".to_string(),
+                    },
+                );
+            }
+            return Some(path);
+        }
+    }
+    None
+}
+
+async fn fetch_latest_release(target: RuntimeTarget) -> Result<GithubRelease> {
+    let repo = runtime_repo(target);
+    // Use /releases instead of /releases/latest to catch pre-releases (nightly)
+    let url = format!("https://api.github.com/repos/{}/releases", repo);
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(url)
+        .header(USER_AGENT, "Lunu-CLI")
+        .send()
+        .await?
+        .error_for_status()?;
+    
+    // The API returns an array of releases. We want the first one.
+    let releases: Vec<GithubRelease> = resp.json().await?;
+    releases.into_iter().next().ok_or_else(|| anyhow::anyhow!("No releases found for {}", repo))
+}
+
+fn pick_windows_asset(release: &GithubRelease, target: RuntimeTarget) -> Option<GithubAsset> {
+    let name = runtime_name(target);
+    release.assets.iter().find(|a| {
+        let n = a.name.to_lowercase();
+        // Support both .exe and .zip, MUST contain "windows" and "x86_64" (avoid arm/aarch64)
+        (n.ends_with(".exe") || n.ends_with(".zip")) && n.contains(name) && n.contains("windows") && n.contains("x86_64")
+    }).cloned()
+}
+
+async fn find_runtime_update(target: RuntimeTarget) -> Result<Option<RuntimeUpdate>> {
+    let latest = fetch_latest_release(target).await?;
+    let current = read_runtime_meta(target).map(|m| m.version);
+    if let Some(ref current) = current {
+        if current == &latest.tag_name {
+            return Ok(None);
+        }
+    }
+    let asset = pick_windows_asset(&latest, target)
+        .ok_or_else(|| anyhow::anyhow!("No Windows executable/zip found in latest {} release", runtime_name(target)))?;
+    Ok(Some(RuntimeUpdate {
+        version: latest.tag_name,
+        url: asset.browser_download_url,
+    }))
+}
+
+async fn download_runtime(target: RuntimeTarget, update: &RuntimeUpdate) -> Result<PathBuf> {
+    let url = &update.url;
+    println!("Downloading {} from {}...", runtime_name(target), url);
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(url)
+        .header(USER_AGENT, "Lunu-CLI")
+        .send()
+        .await?
+        .error_for_status()?;
+    let bytes = resp.bytes().await?;
+    
+    let path = runtime_cache_bin(target);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    if url.ends_with(".zip") {
+        let reader = std::io::Cursor::new(bytes);
+        let mut zip = zip::ZipArchive::new(reader)?;
+        
+        // Find the .exe inside the zip
+        let mut file_idx = None;
+        for i in 0..zip.len() {
+            let file = zip.by_index(i)?;
+            if file.name().ends_with(".exe") {
+                file_idx = Some(i);
+                break;
+            }
+        }
+        
+        let mut file = zip.by_index(file_idx.ok_or(anyhow::anyhow!("No .exe found inside zip"))?)?;
+        let mut content = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut content)?;
+        
+        let tmp = path.with_extension("exe.tmp");
+        std::fs::write(&tmp, content)?;
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+        std::fs::rename(&tmp, &path)?;
+    } else {
+        let tmp = path.with_extension("exe.tmp");
+        std::fs::write(&tmp, bytes)?;
+        if path.exists() {
+             let _ = std::fs::remove_file(&path);
+        }
+        std::fs::rename(&tmp, &path)?;
+    }
+
+    write_runtime_meta(
+        target,
+        &RuntimeMeta {
+            version: update.version.clone(),
+            source: "github".to_string(),
+        },
+    )?;
+    Ok(path)
+}
+
+async fn update_runtime(target: RuntimeTarget) -> Result<()> {
+    match find_runtime_update(target).await? {
+        Some(update) => {
+            let path = download_runtime(target, &update).await?;
+            println!("Updated {} runtime to {} at {:?}", runtime_name(target), update.version, path);
+        }
+        None => {
+            println!("{} runtime is up to date", runtime_name(target));
+        }
+    }
+    Ok(())
+}
+
+async fn maybe_prompt_update(target: RuntimeTarget) -> Result<()> {
+    if !stdin_is_interactive() {
+        return Ok(());
+    }
+    let update = match find_runtime_update(target).await {
+        Ok(value) => value,
+        Err(err) => {
+            println!("Runtime update check failed for {}: {}", runtime_name(target), err);
+            return Ok(());
+        }
+    };
+    if let Some(update) = update {
+        print!(
+            "Update {} runtime to {}? [y/N]: ",
+            runtime_name(target),
+            update.version
+        );
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let v = input.trim().to_lowercase();
+        if v == "y" || v == "yes" {
+            let _ = download_runtime(target, &update).await;
+        }
+    }
+    Ok(())
 }
 
 fn select_runtime() -> Result<RuntimeKind> {
@@ -257,14 +533,12 @@ fn runtime_config_for(runtime: RuntimeKind) -> RuntimeConfig {
     match runtime {
         RuntimeKind::Lute => RuntimeConfig {
             name: "lute".to_string(),
-            engine: "C++".to_string(),
             security: "Full system access, no sandboxing, maximum flexibility".to_string(),
             performance: "Highest performance with direct native execution".to_string(),
             notes: "Use @lute and @std, build native modules directly (C/C++/Rust)".to_string(),
         },
         RuntimeKind::Lune => RuntimeConfig {
             name: "lune".to_string(),
-            engine: "Rust".to_string(),
             security: "Sandboxed defaults with bridge isolation".to_string(),
             performance: "Great for tooling; bridge calls add overhead".to_string(),
             notes: "Bridge-based integration for external languages".to_string(),
@@ -437,13 +711,20 @@ async fn main() -> Result<()> {
             bridge_server::run().await?;
         },
         Some(Commands::Build { script, output, force, open, icon, open_cmd }) => {
+            check_bridge_dependencies(&root).await;
             let runtime = resolve_runtime_for_root(&root).await?;
             match runtime {
                 RuntimeKind::Lute => {
                     build_with_lute(&root, &script, output, open, &icon, &open_cmd)?;
                 }
                 RuntimeKind::Lune => {
-                    lunu_builder::build_executable(&script, output, force, open, icon, open_cmd, None)?;
+                    let runtime_path = runtime_cache_bin(RuntimeTarget::Lune);
+                    let final_path = if runtime_path.exists() {
+                        Some(runtime_path)
+                    } else {
+                        find_lune_executable(&root)
+                    };
+                    lunu_builder::build_executable(&script, output, force, open, icon, open_cmd, final_path)?;
                 }
             }
         },
@@ -458,7 +739,52 @@ async fn main() -> Result<()> {
         },
         Some(Commands::Run { script, args }) => {
             let runtime = resolve_runtime_for_root(&root).await?;
+            maybe_prompt_update(runtime_target_from_kind(runtime)).await?;
             run_script(&root, &script, &args, runtime)?;
+        },
+        Some(Commands::Test { file }) => {
+            let runtime = resolve_runtime_for_root(&root).await?;
+            run_tests(&root, file, runtime).await?;
+        },
+        Some(Commands::Runtime { runtime, update }) => {
+            if update {
+                update_runtime(runtime).await?;
+            } else {
+                let path = runtime_cache_bin(runtime);
+                let meta = read_runtime_meta(runtime);
+                if let Some(meta) = meta {
+                    println!("{} runtime: {} ({}) at {:?}", runtime_name(runtime), meta.version, meta.source, path);
+                } else if path.exists() {
+                    println!("{} runtime: installed at {:?}", runtime_name(runtime), path);
+                } else {
+                    println!("{} runtime: not installed. Use --update to fetch.", runtime_name(runtime));
+                }
+            }
+        },
+        Some(Commands::Runtimes { update }) => {
+            if update {
+                update_runtime(RuntimeTarget::Lute).await?;
+                update_runtime(RuntimeTarget::Lune).await?;
+            } else {
+                let lute_path = runtime_cache_bin(RuntimeTarget::Lute);
+                let lune_path = runtime_cache_bin(RuntimeTarget::Lune);
+                let lute_meta = read_runtime_meta(RuntimeTarget::Lute);
+                let lune_meta = read_runtime_meta(RuntimeTarget::Lune);
+                if let Some(meta) = lute_meta {
+                    println!("lute runtime: {} ({}) at {:?}", meta.version, meta.source, lute_path);
+                } else if lute_path.exists() {
+                    println!("lute runtime: installed at {:?}", lute_path);
+                } else {
+                    println!("lute runtime: not installed. Use --update to fetch.");
+                }
+                if let Some(meta) = lune_meta {
+                    println!("lune runtime: {} ({}) at {:?}", meta.version, meta.source, lune_path);
+                } else if lune_path.exists() {
+                    println!("lune runtime: installed at {:?}", lune_path);
+                } else {
+                    println!("lune runtime: not installed. Use --update to fetch.");
+                }
+            }
         },
         Some(Commands::Add { query, alias }) => {
             println!("Searching for '{}'...", query);
@@ -520,6 +846,16 @@ async fn main() -> Result<()> {
                 installed_at: current_timestamp(),
             });
             lock.save(&lock_path).await?;
+        },
+        Some(Commands::Clean) => {
+            let cache_dir = runtime_cache_dir();
+            if cache_dir.exists() {
+                println!("Cleaning cache at {:?}...", cache_dir);
+                async_fs::remove_dir_all(&cache_dir).await?;
+                println!("Cache cleaned.");
+            } else {
+                println!("Cache is already empty.");
+            }
         },
         Some(Commands::Upgrade) => {
             self_update().await?;
@@ -827,8 +1163,8 @@ fn main_template(runtime: RuntimeKind) -> String {
             "local path = require(\"@std/path\")",
             "",
             "print(\"Hello from Lute\")",
-            "print(\"cwd:\", process.cwd())",
-            "print(\"exe:\", process.execpath())",
+            "print(`cwd: {process.cwd()}`)",
+            "print(`exe: {process.execpath()}`)",
             "",
         ]
         .join("\n"),
@@ -938,7 +1274,7 @@ async fn init_project(root: &Path) -> Result<()> {
         let lunu_mod_dir = modules_dir.join("lunu");
         if !lunu_mod_dir.exists() {
             async_fs::create_dir_all(&lunu_mod_dir).await?;
-            let init_content = include_str!("../../../init.luau");
+            let init_content = include_str!("../../init.luau");
             async_fs::write(lunu_mod_dir.join("init.luau"), init_content).await?;
             println!("Installed Lunu core library to modules/lunu");
         }
@@ -1139,10 +1475,109 @@ async fn create_module(root: &Path, name: &str, lang: ModuleLang) -> Result<()> 
             ]
             .join("\n"),
         ),
+        ModuleLang::Rust => (
+            "src/main.rs",
+            [
+                "use std::io::{self, BufRead, Write};",
+                "use serde::{Deserialize, Serialize};",
+                "use serde_json::Value;",
+                "",
+                "#[derive(Deserialize)]",
+                "struct Request {",
+                "    id: Option<String>,",
+                "    method: String,",
+                "    params: Option<Value>,",
+                "}",
+                "",
+                "#[derive(Serialize)]",
+                "struct Response {",
+                "    id: Option<String>,",
+                "    #[serde(skip_serializing_if = \"Option::is_none\")]",
+                "    result: Option<Value>,",
+                "    #[serde(skip_serializing_if = \"Option::is_none\")]",
+                "    error: Option<ErrorVal>,",
+                "}",
+                "",
+                "#[derive(Serialize)]",
+                "struct ErrorVal {",
+                "    code: String,",
+                "    message: String,",
+                "}",
+                "",
+                "fn main() {",
+                "    let stdin = io::stdin();",
+                "    let mut stdout = io::stdout();",
+                "    for line in stdin.lock().lines() {",
+                "        if let Ok(line) = line {",
+                "            if line.trim().is_empty() { continue; }",
+                "            if let Ok(req) = serde_json::from_str::<Request>(&line) {",
+                "                let res = handle(req);",
+                "                if let Ok(json) = serde_json::to_string(&res) {",
+                "                    writeln!(stdout, \"{}\", json).ok();",
+                "                    stdout.flush().ok();",
+                "                }",
+                "            }",
+                "        }",
+                "    }",
+                "}",
+                "",
+                "fn handle(req: Request) -> Response {",
+                "    match req.method.as_str() {",
+                "        \"greet\" => {",
+                "            let name = req.params.as_ref()",
+                "                .and_then(|v| v.as_array())",
+                "                .and_then(|a| a.get(0))",
+                "                .and_then(|v| v.as_str())",
+                "                .unwrap_or(\"\");",
+                "            Response {",
+                "                id: req.id,",
+                "                result: Some(Value::String(format!(\"Hello from Rust, {}!\", name))),",
+                "                error: None,",
+                "            }",
+                "        },",
+                "        \"echo\" => {",
+                "            let arg = req.params.as_ref()",
+                "                .and_then(|v| v.as_array())",
+                "                .and_then(|a| a.get(0))",
+                "                .cloned();",
+                "            Response {",
+                "                id: req.id,",
+                "                result: arg,",
+                "                error: None,",
+                "            }",
+                "        },",
+                "        _ => Response {",
+                "            id: req.id,",
+                "            result: None,",
+                "            error: Some(ErrorVal { code: \"404\".into(), message: \"Method not found\".into() }),",
+                "        }",
+                "    }",
+                "}",
+            ].join("\n"),
+        ),
     };
 
-    let worker_path = module_dir.join(worker_name);
-    async_fs::write(&worker_path, worker_content).await?;
+    if matches!(lang, ModuleLang::Rust) {
+        let src_dir = module_dir.join("src");
+        async_fs::create_dir_all(&src_dir).await?;
+        
+        let cargo_toml = [
+            "[package]",
+            &format!("name = \"{}\"", name),
+            "version = \"0.1.0\"",
+            "edition = \"2021\"",
+            "",
+            "[dependencies]",
+            "serde = { version = \"1.0\", features = [\"derive\"] }",
+            "serde_json = \"1.0\"",
+        ].join("\n");
+        
+        async_fs::write(module_dir.join("Cargo.toml"), cargo_toml).await?;
+        async_fs::write(src_dir.join("main.rs"), worker_content).await?;
+    } else {
+        let worker_path = module_dir.join(worker_name);
+        async_fs::write(&worker_path, worker_content).await?;
+    }
 
     let bridge_json = match lang {
         ModuleLang::Python => serde_json::json!({
@@ -1153,6 +1588,16 @@ async fn create_module(root: &Path, name: &str, lang: ModuleLang) -> Result<()> 
         ModuleLang::Node => serde_json::json!({
             "protocol": "lunu-worker-v1",
             "worker": { "cmd": ["node", worker_name], "cwd": ".", "env": {} },
+            "methods": { "greet": {}, "echo": {} }
+        }),
+        ModuleLang::Rust => serde_json::json!({
+            "protocol": "lunu-worker-v1",
+            "worker": { 
+                "cmd": [format!("target/release/{}.exe", name)], 
+                "cwd": ".", 
+                "env": {},
+                "notes": "Run 'cargo build --release' in this folder to build the worker."
+            },
             "methods": { "greet": {}, "echo": {} }
         }),
     };
@@ -1197,6 +1642,10 @@ fn find_lune_executable(root: &Path) -> Option<PathBuf> {
             return Some(p);
         }
     }
+    let cached = runtime_cache_bin(RuntimeTarget::Lune);
+    if cached.exists() {
+        return Some(cached);
+    }
     find_in_path("lune.exe")
 }
 
@@ -1211,22 +1660,14 @@ fn find_lute_executable(root: &Path) -> Option<PathBuf> {
             return Some(p);
         }
     }
+    let cached = runtime_cache_bin(RuntimeTarget::Lute);
+    if cached.exists() {
+        return Some(cached);
+    }
     if let Some(p) = find_in_path("lute.exe") {
         return Some(p);
     }
-    let tmp = std::env::temp_dir().join("lunu_runtime").join("lute.exe");
-    if !tmp.exists() {
-        if let Some(bytes) = embedded_lute_bytes() {
-            let _ = fs::create_dir_all(tmp.parent().unwrap());
-            if let Ok(mut f) = File::create(&tmp) {
-                let _ = f.write_all(bytes);
-            }
-        }
-    }
-    if tmp.exists() {
-        return Some(tmp);
-    }
-    None
+    ensure_embedded_lute()
 }
 
 fn find_in_path(binary: &str) -> Option<PathBuf> {
@@ -1242,6 +1683,96 @@ fn find_in_path(binary: &str) -> Option<PathBuf> {
 
 fn embedded_lute_bytes() -> Option<&'static [u8]> {
     Some(include_bytes!("../resources/lute.exe"))
+}
+
+async fn run_tests(root: &Path, specific_file: Option<PathBuf>, runtime: RuntimeKind) -> Result<()> {
+    println!("Running tests using {} runtime...", match runtime { RuntimeKind::Lute => "Lute", RuntimeKind::Lune => "Lune" });
+    
+    let mut test_files = Vec::new();
+    
+    if let Some(f) = specific_file {
+        if !f.exists() {
+             return Err(anyhow::anyhow!("Test file not found: {:?}", f));
+        }
+        test_files.push(f);
+    } else {
+        // Scan for *.test.luau and *.spec.luau
+        let mut dirs = vec![root.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            let mut entries = match async_fs::read_dir(&dir).await {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.is_dir() {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    if name != "node_modules" && name != "target" && name != ".git" && name != "dist" {
+                        dirs.push(path);
+                    }
+                } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.ends_with(".test.luau") || name.ends_with(".spec.luau") {
+                        test_files.push(path);
+                    }
+                }
+            }
+        }
+    }
+
+    if test_files.is_empty() {
+        println!("No test files found.");
+        return Ok(());
+    }
+
+    println!("Found {} test file(s).", test_files.len());
+    let mut failed = 0;
+
+    for file in test_files {
+        print!("Testing {:?} ... ", file.file_name().unwrap());
+        io::stdout().flush()?;
+        
+        let start = std::time::Instant::now();
+        let status = match runtime {
+            RuntimeKind::Lute => {
+                let lute = find_lute_executable(root).ok_or_else(|| anyhow::anyhow!("Lute not found"))?;
+                Command::new(&lute)
+                    .arg("run")
+                    .arg(&file)
+                    .current_dir(root)
+                    .output()
+                    .with_context(|| "Failed to run lute")?
+            }
+            RuntimeKind::Lune => {
+                let lune = find_lune_executable(root).ok_or_else(|| anyhow::anyhow!("Lune not found"))?;
+                Command::new(&lune)
+                    .arg("run")
+                    .arg(&file)
+                    .current_dir(root)
+                    .output()
+                    .with_context(|| "Failed to run lune")?
+            }
+        };
+
+        let duration = start.elapsed();
+        if status.status.success() {
+            println!("OK ({:.2?})", duration);
+        } else {
+            println!("FAIL ({:.2?})", duration);
+            println!("--- Output ---");
+            io::stdout().write_all(&status.stdout)?;
+            io::stderr().write_all(&status.stderr)?;
+            println!("--------------");
+            failed += 1;
+        }
+    }
+
+    if failed > 0 {
+        return Err(anyhow::anyhow!("{} test(s) failed.", failed));
+    }
+    
+    println!("All tests passed!");
+    Ok(())
 }
 
 fn run_script(root: &Path, script: &Path, args: &[String], runtime: RuntimeKind) -> Result<()> {
@@ -1513,7 +2044,7 @@ async fn check_environment(root: &Path) -> Result<()> {
     if config_path.exists() {
         if let Ok(cfg) = ProjectConfig::load(&config_path).await {
             if let Some(runtime) = cfg.runtime {
-                println!("- Runtime: {} ({})", runtime.name, runtime.engine);
+                println!("- Runtime: {}", runtime.name);
                 if runtime.name == "lute" {
                     let lute = find_lute_executable(root);
                     let toolchain = detect_cpp_toolchain();
@@ -1525,6 +2056,9 @@ async fn check_environment(root: &Path) -> Result<()> {
                     let entry = root.join(&cfg.project.entry);
                     if !entry.exists() {
                         return Err(anyhow::anyhow!("Entry file not found for Lute check: {:?}", entry));
+                    }
+                    if let Some(p) = &lute {
+                        println!("  Path: {:?}", p);
                     }
                     let lute = lute.ok_or_else(|| anyhow::anyhow!("Lute runtime not found. Set LUTE_PATH, place bin/lute.exe in the project, or add lute.exe to PATH."))?;
                     let status = Command::new(&lute)
@@ -1538,8 +2072,11 @@ async fn check_environment(root: &Path) -> Result<()> {
                     }
                 }
                 if runtime.name == "lune" {
-                    let lune_found = find_lune_executable(root).is_some();
-                    println!("- Lune executable: {}", lune_found);
+                    let lune_path = find_lune_executable(root);
+                    println!("- Lune executable: {}", lune_path.is_some());
+                    if let Some(p) = lune_path {
+                        println!("  Path: {:?}", p);
+                    }
                 }
             }
         }
@@ -1558,6 +2095,59 @@ fn find_root(start: &std::path::Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+async fn check_bridge_dependencies(root: &Path) {
+    let modules_dir = root.join("modules");
+    if !modules_dir.exists() {
+        return;
+    }
+
+    let mut dir = match async_fs::read_dir(&modules_dir).await {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    while let Ok(Some(entry)) = dir.next_entry().await {
+        let path = entry.path();
+        if path.is_dir() {
+            let bridge_json = path.join("bridge.json");
+            if bridge_json.exists() {
+                check_module_dependency(&path).await;
+            }
+        }
+    }
+}
+
+async fn check_module_dependency(module_dir: &Path) {
+    // Read bridge.json
+    let content = match async_fs::read_to_string(module_dir.join("bridge.json")).await {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    
+    let json: Value = match serde_json::from_str(&content) {
+        Ok(j) => j,
+        Err(_) => return,
+    };
+    
+    if let Some(cmd_arr) = json.get("worker").and_then(|w| w.get("cmd")).and_then(|c| c.as_array()) {
+        if let Some(cmd_val) = cmd_arr.get(0).and_then(|v| v.as_str()) {
+            let cmd = cmd_val.to_string();
+            // Check for common interpreters
+            if ["python", "node", "npm", "cargo", "go", "ruby", "perl", "php", "java"].contains(&cmd.as_str()) {
+                 let local_path = module_dir.join(&cmd);
+                 let local_path_exe = module_dir.join(format!("{}.exe", cmd));
+                 
+                 if !local_path.exists() && !local_path_exe.exists() {
+                     println!("WARN: Module '{}' depends on system command '{}'.", module_dir.file_name().unwrap().to_string_lossy(), cmd);
+                     println!("      Ensure target users have '{}' installed, or bundle a portable version in the module folder.", cmd);
+                 } else {
+                     println!("INFO: Module '{}' uses bundled runtime for '{}'.", module_dir.file_name().unwrap().to_string_lossy(), cmd);
+                 }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

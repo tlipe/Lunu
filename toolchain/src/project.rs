@@ -32,7 +32,6 @@ pub struct ProjectConfig {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RuntimeConfig {
     pub name: String,
-    pub engine: String,
     pub security: String,
     pub performance: String,
     pub notes: String,
@@ -53,6 +52,7 @@ pub struct BuildConfig {
 }
 
 impl ProjectConfig {
+    #[cfg(test)]
     pub fn new(name: &str) -> Self {
         Self {
             project: ProjectInfo {
