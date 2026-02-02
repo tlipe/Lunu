@@ -23,7 +23,11 @@ Lunu is built using a modern and high-performance stack:
 *   **Runtimes**:
     *   **Lune**: A standalone Luau runtime with file system and process access, used for tooling and bridge integrations.
     *   **Lute**: A high-performance native runtime that allows direct linking with C/C++ libraries.
+*   **Bridge Server**: Axum + Tower HTTP for the dev bridge runtime and observability hooks.
 *   **Serialization**: Serde (Rust) and `serde_json` / `@lune/serde` for robust data exchange.
+*   **Packaging**: Zip/Tar + Flate2 for runtime distribution and bundling.
+*   **Git Integrations**: git2 for dependency install/update from repositories.
+*   **Diagnostics**: tracing + tracing-subscriber for structured logs.
 
 ---
 
@@ -154,4 +158,4 @@ In Lute, you don't need a bridge. You simply `require` the native module, and it
 
 This project is licensed under the **Mozilla Public License 2.0**. See the `LICENSE.txt` file for more details.
 
-# Made by a Brazilian.
+## Made by a Brazilian.

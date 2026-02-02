@@ -8,7 +8,7 @@ mod lock;
 use clap::{Parser, Subcommand, ValueEnum};
 use lunu_cli::bridge_server;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Path, PathBuf, Component};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::process::Command;
 use std::fs::{self, File};
@@ -21,8 +21,11 @@ use compat::CompatibilityLayer;
 use project::{ProjectConfig, DependencySpec, RuntimeConfig, BuildConfig};
 use lock::{LockFile, LockEntry};
 use fs_extra::dir::{copy as copy_dir, CopyOptions};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::fs as async_fs;
+use flate2::read::GzDecoder;
+use tar::Archive;
 
 use std::io::{self, Write};
 #[cfg(windows)]
@@ -35,6 +38,8 @@ use winapi::um::consoleapi::GetConsoleMode;
 use winapi::um::processenv::GetStdHandle;
 #[cfg(windows)]
 use winapi::um::winbase::STD_INPUT_HANDLE;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 
 #[derive(Parser)]
@@ -180,7 +185,7 @@ enum ModuleLang {
     Rust,
 }
 
-#[derive(ValueEnum, Clone, Copy)]
+#[derive(ValueEnum, Clone, Copy, PartialEq, Eq)]
 enum RuntimeTarget {
     Lute,
     Lune,
@@ -197,6 +202,7 @@ enum RuntimeKind {
 const LUTE_REPO: &str = "luau-lang/lute";
 const LUNE_REPO: &str = "lune-org/lune";
 const LUTE_EMBEDDED_VERSION: &str = "0.1.0";
+const UPDATE_CHECK_INTERVAL_SECS: u64 = 6 * 60 * 60;
 
 struct ToolchainDetection {
     c_compiler: Option<PathBuf>,
@@ -260,6 +266,11 @@ struct RuntimeUpdate {
     url: String,
 }
 
+#[derive(serde::Deserialize)]
+struct GithubRepoInfo {
+    default_branch: String,
+}
+
 fn runtime_target_from_kind(kind: RuntimeKind) -> RuntimeTarget {
     match kind {
         RuntimeKind::Lute => RuntimeTarget::Lute,
@@ -281,6 +292,149 @@ fn runtime_name(target: RuntimeTarget) -> &'static str {
     }
 }
 
+fn runtime_bin_filename(target: RuntimeTarget) -> String {
+    if cfg!(windows) {
+        format!("{}.exe", runtime_name(target))
+    } else {
+        runtime_name(target).to_string()
+    }
+}
+
+fn executable_extension() -> Option<&'static str> {
+    if cfg!(windows) {
+        Some("exe")
+    } else {
+        None
+    }
+}
+
+fn lunu_bin_filename() -> String {
+    if cfg!(windows) {
+        "lunu.exe".to_string()
+    } else {
+        "lunu".to_string()
+    }
+}
+
+fn old_exe_path(current_exe: &Path) -> PathBuf {
+    if cfg!(windows) {
+        current_exe.with_extension("exe.old")
+    } else {
+        current_exe.with_extension("old")
+    }
+}
+
+fn builder_bin_filename() -> String {
+    if cfg!(windows) {
+        "lunu-builder.exe".to_string()
+    } else {
+        "lunu-builder".to_string()
+    }
+}
+
+fn platform_os_keys() -> Vec<&'static str> {
+    match std::env::consts::OS {
+        "windows" => vec!["windows", "win"],
+        "macos" => vec!["macos", "darwin", "osx"],
+        "linux" => vec!["linux"],
+        other => vec![other],
+    }
+}
+
+fn platform_arch_keys() -> Vec<&'static str> {
+    match std::env::consts::ARCH {
+        "x86_64" => vec!["x86_64", "amd64", "x64"],
+        "aarch64" => vec!["aarch64", "arm64"],
+        "arm" => vec!["armv7", "arm"],
+        other => vec![other],
+    }
+}
+
+fn asset_matches_platform(name: &str, require_arch: bool) -> bool {
+    let os_keys = platform_os_keys();
+    let arch_keys = platform_arch_keys();
+    let has_os = os_keys.iter().any(|k| name.contains(k));
+    if !has_os {
+        return false;
+    }
+    if require_arch {
+        let has_arch = arch_keys.iter().any(|k| name.contains(k));
+        if !has_arch {
+            return false;
+        }
+    }
+    true
+}
+
+fn asset_extension_supported(name: &str) -> bool {
+    if name.ends_with(".zip") || name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+        return true;
+    }
+    if cfg!(windows) && name.ends_with(".exe") {
+        return true;
+    }
+    let plain = !name.contains('.') && !name.ends_with('/') && !name.ends_with('\\');
+    if !cfg!(windows) && plain {
+        return true;
+    }
+    false
+}
+
+fn ensure_executable(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms)?;
+    }
+    Ok(())
+}
+
+fn matches_candidate_name(file_name: &str, candidates: &[String]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| file_name.eq_ignore_ascii_case(candidate))
+}
+
+fn extract_binary_from_zip(bytes: &[u8], candidates: &[String]) -> Result<Vec<u8>> {
+    let reader = std::io::Cursor::new(bytes);
+    let mut zip = zip::ZipArchive::new(reader)?;
+    for i in 0..zip.len() {
+        let mut file = zip.by_index(i)?;
+        if file.name().ends_with('/') {
+            continue;
+        }
+        let name = file.name().to_string();
+        let file_name = Path::new(&name).file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if matches_candidate_name(file_name, candidates) {
+            let mut content = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut content)?;
+            return Ok(content);
+        }
+    }
+    Err(anyhow::anyhow!("Binary not found in zip archive"))
+}
+
+fn extract_binary_from_tar_gz(bytes: &[u8], candidates: &[String]) -> Result<Vec<u8>> {
+    let reader = std::io::Cursor::new(bytes);
+    let decoder = GzDecoder::new(reader);
+    let mut archive = Archive::new(decoder);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if entry.header().entry_type().is_dir() {
+            continue;
+        }
+        let entry_path = entry.path()?;
+        let file_name = entry_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if matches_candidate_name(file_name, candidates) {
+            let mut content = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut content)?;
+            return Ok(content);
+        }
+    }
+    Err(anyhow::anyhow!("Binary not found in tar archive"))
+}
+
 fn runtime_cache_dir() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(|| std::env::temp_dir())
@@ -289,7 +443,49 @@ fn runtime_cache_dir() -> PathBuf {
 }
 
 fn runtime_cache_bin(target: RuntimeTarget) -> PathBuf {
-    runtime_cache_dir().join(format!("{}.exe", runtime_name(target)))
+    runtime_cache_dir().join(runtime_bin_filename(target))
+}
+
+fn runtime_lib_root(target: RuntimeTarget) -> PathBuf {
+    runtime_cache_dir().join(runtime_name(target))
+}
+
+fn lute_sources_root() -> PathBuf {
+    runtime_cache_dir().join("lute-src")
+}
+
+fn runtime_available(root: &Path, target: RuntimeTarget) -> bool {
+    let local = root.join("bin").join(runtime_bin_filename(target));
+    if local.exists() {
+        return true;
+    }
+    let env_key = match target {
+        RuntimeTarget::Lute => "LUTE_PATH",
+        RuntimeTarget::Lune => "LUNE_PATH",
+    };
+    if let Ok(path) = std::env::var(env_key) {
+        if PathBuf::from(path).exists() {
+            return true;
+        }
+    }
+    let cached = runtime_cache_bin(target);
+    if cached.exists() {
+        return true;
+    }
+    find_in_path(&runtime_bin_filename(target)).is_some()
+}
+
+async fn ensure_runtime_available(root: &Path, target: RuntimeTarget) -> Result<()> {
+    if runtime_available(root, target) {
+        return Ok(());
+    }
+    if let Err(err) = update_runtime(target).await {
+        if target == RuntimeTarget::Lute && ensure_embedded_lute().is_some() {
+            return Ok(());
+        }
+        return Err(err);
+    }
+    Ok(())
 }
 
 fn runtime_meta_path(target: RuntimeTarget) -> PathBuf {
@@ -312,7 +508,52 @@ fn write_runtime_meta(target: RuntimeTarget, meta: &RuntimeMeta) -> Result<()> {
     Ok(())
 }
 
+#[derive(Serialize, Deserialize, Default)]
+struct UpdateCheckCache {
+    last_check: BTreeMap<String, u64>,
+}
+
+fn update_check_cache_path() -> PathBuf {
+    runtime_cache_dir().join("update-check.json")
+}
+
+fn read_update_check_cache() -> UpdateCheckCache {
+    let path = update_check_cache_path();
+    if let Ok(content) = std::fs::read_to_string(path) {
+        serde_json::from_str(&content).unwrap_or_default()
+    } else {
+        UpdateCheckCache::default()
+    }
+}
+
+fn write_update_check_cache(cache: &UpdateCheckCache) -> Result<()> {
+    let path = update_check_cache_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let content = serde_json::to_string(cache)?;
+    std::fs::write(path, content)?;
+    Ok(())
+}
+
+fn should_check_update(cache: &UpdateCheckCache, target: RuntimeTarget) -> bool {
+    let key = runtime_name(target);
+    match cache.last_check.get(key) {
+        Some(value) => current_timestamp().saturating_sub(*value) >= UPDATE_CHECK_INTERVAL_SECS,
+        None => true,
+    }
+}
+
+fn record_update_check(cache: &mut UpdateCheckCache, target: RuntimeTarget) {
+    cache
+        .last_check
+        .insert(runtime_name(target).to_string(), current_timestamp());
+}
+
 fn ensure_embedded_lute() -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
     let target = RuntimeTarget::Lute;
     let path = runtime_cache_bin(target);
     if path.exists() {
@@ -358,13 +599,29 @@ async fn fetch_latest_release(target: RuntimeTarget) -> Result<GithubRelease> {
     releases.into_iter().next().ok_or_else(|| anyhow::anyhow!("No releases found for {}", repo))
 }
 
-fn pick_windows_asset(release: &GithubRelease, target: RuntimeTarget) -> Option<GithubAsset> {
+fn pick_runtime_asset(release: &GithubRelease, target: RuntimeTarget) -> Option<GithubAsset> {
     let name = runtime_name(target);
-    release.assets.iter().find(|a| {
-        let n = a.name.to_lowercase();
-        // Support both .exe and .zip, MUST contain "windows" and "x86_64" (avoid arm/aarch64)
-        (n.ends_with(".exe") || n.ends_with(".zip")) && n.contains(name) && n.contains("windows") && n.contains("x86_64")
-    }).cloned()
+    let mut candidates: Vec<GithubAsset> = release
+        .assets
+        .iter()
+        .filter(|a| {
+            let n = a.name.to_lowercase();
+            n.contains(name) && asset_extension_supported(&n)
+        })
+        .cloned()
+        .collect();
+
+    candidates.sort_by_key(|a| a.name.to_lowercase());
+
+    for require_arch in [true, false] {
+        if let Some(asset) = candidates.iter().find(|a| {
+            let n = a.name.to_lowercase();
+            asset_matches_platform(&n, require_arch)
+        }) {
+            return Some(asset.clone());
+        }
+    }
+    None
 }
 
 async fn find_runtime_update(target: RuntimeTarget) -> Result<Option<RuntimeUpdate>> {
@@ -375,8 +632,8 @@ async fn find_runtime_update(target: RuntimeTarget) -> Result<Option<RuntimeUpda
             return Ok(None);
         }
     }
-    let asset = pick_windows_asset(&latest, target)
-        .ok_or_else(|| anyhow::anyhow!("No Windows executable/zip found in latest {} release", runtime_name(target)))?;
+    let asset = pick_runtime_asset(&latest, target)
+        .ok_or_else(|| anyhow::anyhow!("No compatible runtime asset found in latest {} release", runtime_name(target)))?;
     Ok(Some(RuntimeUpdate {
         version: latest.tag_name,
         url: asset.browser_download_url,
@@ -399,38 +656,102 @@ async fn download_runtime(target: RuntimeTarget, update: &RuntimeUpdate) -> Resu
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let lib_root = runtime_lib_root(target);
+    let url_lower = url.to_lowercase();
+    let runtime_filename = runtime_bin_filename(target);
+    let runtime_base = runtime_name(target).to_string();
 
-    if url.ends_with(".zip") {
+    if url_lower.ends_with(".zip") {
         let reader = std::io::Cursor::new(bytes);
         let mut zip = zip::ZipArchive::new(reader)?;
-        
-        // Find the .exe inside the zip
-        let mut file_idx = None;
+        let mut runtime_bytes: Option<Vec<u8>> = None;
         for i in 0..zip.len() {
-            let file = zip.by_index(i)?;
-            if file.name().ends_with(".exe") {
-                file_idx = Some(i);
-                break;
+            let mut file = zip.by_index(i)?;
+            let name = file.name().to_string();
+            if name.ends_with('/') {
+                continue;
             }
+            let mut content = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut content)?;
+            let entry_path = Path::new(&name);
+            let file_name = entry_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            let matches = file_name.eq_ignore_ascii_case(&runtime_filename) || file_name.eq_ignore_ascii_case(&runtime_base);
+            if matches && runtime_bytes.is_none() {
+                runtime_bytes = Some(content.clone());
+            }
+            let mut rel = PathBuf::new();
+            for comp in entry_path.components() {
+                if let Component::Normal(c) = comp {
+                    rel.push(c);
+                }
+            }
+            if rel.as_os_str().is_empty() {
+                continue;
+            }
+            let out_path = lib_root.join(rel);
+            if let Some(parent) = out_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&out_path, &content)?;
         }
-        
-        let mut file = zip.by_index(file_idx.ok_or(anyhow::anyhow!("No .exe found inside zip"))?)?;
-        let mut content = Vec::new();
-        std::io::Read::read_to_end(&mut file, &mut content)?;
-        
-        let tmp = path.with_extension("exe.tmp");
+        let content = runtime_bytes.ok_or(anyhow::anyhow!("Runtime binary not found in zip"))?;
+        let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, content)?;
         if path.exists() {
             let _ = std::fs::remove_file(&path);
         }
         std::fs::rename(&tmp, &path)?;
+        ensure_executable(&path)?;
+    } else if url_lower.ends_with(".tar.gz") || url_lower.ends_with(".tgz") {
+        let reader = std::io::Cursor::new(bytes);
+        let decoder = GzDecoder::new(reader);
+        let mut archive = Archive::new(decoder);
+        let mut runtime_bytes: Option<Vec<u8>> = None;
+        let entries = archive.entries()?;
+        for entry in entries {
+            let mut entry = entry?;
+            if entry.header().entry_type().is_dir() {
+                continue;
+            }
+            let entry_path = entry.path()?.to_path_buf();
+            let file_name = entry_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            let mut content = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut content)?;
+            let matches = file_name.eq_ignore_ascii_case(&runtime_filename) || file_name.eq_ignore_ascii_case(&runtime_base);
+            if matches && runtime_bytes.is_none() {
+                runtime_bytes = Some(content.clone());
+            }
+            let mut rel = PathBuf::new();
+            for comp in entry_path.components() {
+                if let Component::Normal(c) = comp {
+                    rel.push(c);
+                }
+            }
+            if rel.as_os_str().is_empty() {
+                continue;
+            }
+            let out_path = lib_root.join(rel);
+            if let Some(parent) = out_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&out_path, &content)?;
+        }
+        let content = runtime_bytes.ok_or(anyhow::anyhow!("Runtime binary not found in tarball"))?;
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, content)?;
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+        std::fs::rename(&tmp, &path)?;
+        ensure_executable(&path)?;
     } else {
-        let tmp = path.with_extension("exe.tmp");
+        let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, bytes)?;
         if path.exists() {
              let _ = std::fs::remove_file(&path);
         }
         std::fs::rename(&tmp, &path)?;
+        ensure_executable(&path)?;
     }
 
     write_runtime_meta(
@@ -456,31 +777,109 @@ async fn update_runtime(target: RuntimeTarget) -> Result<()> {
     Ok(())
 }
 
+async fn fetch_repo_default_branch(repo: &str) -> Result<String> {
+    let url = format!("https://api.github.com/repos/{}", repo);
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(url)
+        .header(USER_AGENT, "Lunu-CLI")
+        .send()
+        .await?
+        .error_for_status()?;
+    let info: GithubRepoInfo = resp.json().await?;
+    Ok(info.default_branch)
+}
+
+async fn download_repo_zip(repo: &str, branch: &str) -> Result<Vec<u8>> {
+    let url = format!("https://codeload.github.com/{}/zip/refs/heads/{}", repo, branch);
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(url)
+        .header(USER_AGENT, "Lunu-CLI")
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(resp.bytes().await?.to_vec())
+}
+
+async fn ensure_lute_sources() -> Result<PathBuf> {
+    let root = lute_sources_root();
+    let std_dir = root.join("std");
+    let lute_dir = root.join("lute");
+    if std_dir.exists() && lute_dir.exists() {
+        return Ok(root);
+    }
+    if root.exists() {
+        let _ = fs::remove_dir_all(&root);
+    }
+    let branch = fetch_repo_default_branch(LUTE_REPO).await.unwrap_or_else(|_| "main".to_string());
+    let mut bytes = download_repo_zip(LUTE_REPO, &branch).await;
+    if bytes.is_err() {
+        for fallback in ["main", "master"] {
+            if fallback != branch {
+                if let Ok(value) = download_repo_zip(LUTE_REPO, fallback).await {
+                    bytes = Ok(value);
+                    break;
+                }
+            }
+        }
+    }
+    let bytes = bytes?;
+    let reader = std::io::Cursor::new(bytes);
+    let mut zip = zip::ZipArchive::new(reader)?;
+    for i in 0..zip.len() {
+        let mut file = zip.by_index(i)?;
+        let name = file.name().to_string();
+        if name.ends_with('/') {
+            continue;
+        }
+        let mut parts = name.splitn(2, '/');
+        let _prefix = parts.next();
+        let relative = match parts.next() {
+            Some(v) => v,
+            None => continue,
+        };
+        if !(relative.starts_with("std/") || relative.starts_with("lute/") || relative.starts_with("batteries/")) {
+            continue;
+        }
+        let out_path = root.join(relative);
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut content = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut content)?;
+        std::fs::write(&out_path, &content)?;
+    }
+    Ok(root)
+}
+
 async fn maybe_prompt_update(target: RuntimeTarget) -> Result<()> {
     if !stdin_is_interactive() {
         return Ok(());
     }
-    let update = match find_runtime_update(target).await {
-        Ok(value) => value,
-        Err(err) => {
-            println!("Runtime update check failed for {}: {}", runtime_name(target), err);
-            return Ok(());
-        }
-    };
-    if let Some(update) = update {
-        print!(
-            "Update {} runtime to {}? [y/N]: ",
-            runtime_name(target),
-            update.version
-        );
-        io::stdout().flush()?;
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let v = input.trim().to_lowercase();
-        if v == "y" || v == "yes" {
-            let _ = download_runtime(target, &update).await;
-        }
+    let mut cache = read_update_check_cache();
+    if !should_check_update(&cache, target) {
+        return Ok(());
     }
+    record_update_check(&mut cache, target);
+    let _ = write_update_check_cache(&cache);
+    tokio::spawn(async move {
+        let update = match find_runtime_update(target).await {
+            Ok(value) => value,
+            Err(err) => {
+                println!("Runtime update check failed for {}: {}", runtime_name(target), err);
+                return;
+            }
+        };
+        if let Some(update) = update {
+            println!(
+                "Update {} runtime available: {}. Run 'lunu runtime {} --update' to install.",
+                runtime_name(target),
+                update.version,
+                runtime_name(target)
+            );
+        }
+    });
     Ok(())
 }
 
@@ -612,17 +1011,31 @@ fn build_config_for(runtime: RuntimeKind, toolchain: Option<ToolchainDetection>)
 }
 
 fn detect_cpp_toolchain() -> ToolchainDetection {
+    #[cfg(windows)]
     let cpp_candidates = [
         ("cl.exe", "msvc"),
         ("clang-cl.exe", "clang-cl"),
         ("clang++.exe", "clang"),
         ("g++.exe", "gcc"),
     ];
+    #[cfg(not(windows))]
+    let cpp_candidates = [
+        ("c++", "cc"),
+        ("clang++", "clang"),
+        ("g++", "gcc"),
+    ];
+    #[cfg(windows)]
     let c_candidates = [
         ("cl.exe", "msvc"),
         ("clang-cl.exe", "clang-cl"),
         ("clang.exe", "clang"),
         ("gcc.exe", "gcc"),
+    ];
+    #[cfg(not(windows))]
+    let c_candidates = [
+        ("cc", "cc"),
+        ("clang", "clang"),
+        ("gcc", "gcc"),
     ];
 
     let mut toolchain = None;
@@ -739,6 +1152,7 @@ async fn main() -> Result<()> {
         },
         Some(Commands::Run { script, args }) => {
             let runtime = resolve_runtime_for_root(&root).await?;
+            ensure_runtime_aliases(&root, runtime).await?;
             maybe_prompt_update(runtime_target_from_kind(runtime)).await?;
             run_script(&root, &script, &args, runtime)?;
         },
@@ -892,26 +1306,64 @@ async fn self_update() -> Result<()> {
 
     // Find asset
     let assets = resp["assets"].as_array().ok_or(anyhow::anyhow!("No assets found"))?;
-    let asset = assets.iter()
-        .find(|a| a["name"].as_str() == Some("lunu.exe"))
-        .ok_or(anyhow::anyhow!("lunu.exe not found in release assets"))?;
-    
-    let download_url = asset["browser_download_url"].as_str().unwrap();
+    let mut candidates: Vec<(String, String)> = assets
+        .iter()
+        .filter_map(|a| {
+            let name = a["name"].as_str()?.to_string();
+            let url = a["browser_download_url"].as_str()?.to_string();
+            let name_lower = name.to_lowercase();
+            if !name_lower.contains("lunu") || !asset_extension_supported(&name_lower) {
+                return None;
+            }
+            Some((name, url))
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Err(anyhow::anyhow!("No compatible assets found"));
+    }
+    candidates.sort_by_key(|(name, _)| name.to_lowercase());
+    let expected = lunu_bin_filename();
+    let mut picked = candidates
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(&expected))
+        .cloned();
+    if picked.is_none() {
+        for require_arch in [true, false] {
+            if let Some(item) = candidates.iter().find(|(name, _)| {
+                let n = name.to_lowercase();
+                asset_matches_platform(&n, require_arch)
+            }) {
+                picked = Some(item.clone());
+                break;
+            }
+        }
+    }
+    let (asset_name, download_url) = picked.unwrap_or_else(|| candidates[0].clone());
 
-    // Download
-    let bytes = client.get(download_url).send().await?.bytes().await?;
+    let bytes = client.get(&download_url).send().await?.bytes().await?;
     
     let current_exe = std::env::current_exe()?;
-    let old_exe = current_exe.with_extension("exe.old");
+    let old_exe = old_exe_path(&current_exe);
     
-    // Rename current to .old (Windows allows renaming running exe)
     if old_exe.exists() {
         let _ = async_fs::remove_file(&old_exe).await;
     }
     async_fs::rename(&current_exe, &old_exe).await?;
     
-    // Write new
-    async_fs::write(&current_exe, bytes).await?;
+    let mut content = bytes.to_vec();
+    let asset_lower = asset_name.to_lowercase();
+    let bin_candidates = vec![
+        lunu_bin_filename(),
+        "lunu".to_string(),
+        "lunu.exe".to_string(),
+    ];
+    if asset_lower.ends_with(".zip") {
+        content = extract_binary_from_zip(&content, &bin_candidates)?;
+    } else if asset_lower.ends_with(".tar.gz") || asset_lower.ends_with(".tgz") {
+        content = extract_binary_from_tar_gz(&content, &bin_candidates)?;
+    }
+    async_fs::write(&current_exe, content).await?;
+    ensure_executable(&current_exe)?;
     
     println!("Updated successfully to {}!", latest_tag);
     Ok(())
@@ -953,21 +1405,22 @@ async fn self_uninstall() -> Result<()> {
              // Copy self to temp to finish uninstallation
              // Actually, we can just schedule deletion on reboot or use a batch script
              // But simpler: just rename self and try to delete dir, ignoring self error
-             let old_exe = current_exe.with_extension("exe.old");
-             let _ = async_fs::rename(&current_exe, &old_exe).await;
-             
-             // Try to delete everything else
-             // remove_dir_all might fail on the dir itself if files are open
-             // We can spawn a cmd to delete it after delay
-             
-             let cmd_script = format!("timeout /t 2 /nobreak > NUL & rmdir /s /q \"{}\"", install_dir.display());
-             Command::new("cmd")
-                .arg("/C")
-                .arg(cmd_script)
-                .spawn()?;
-             
-             println!("Uninstall scheduled. Please exit the terminal.");
-             std::process::exit(0);
+            let old_exe = old_exe_path(&current_exe);
+            let _ = async_fs::rename(&current_exe, &old_exe).await;
+            #[cfg(windows)]
+            {
+                let cmd_script = format!("timeout /t 2 /nobreak > NUL & rmdir /s /q \"{}\"", install_dir.display());
+                Command::new("cmd")
+                   .arg("/C")
+                   .arg(cmd_script)
+                   .spawn()?;
+                println!("Uninstall scheduled. Please exit the terminal.");
+                std::process::exit(0);
+            }
+            #[cfg(not(windows))]
+            {
+                async_fs::remove_dir_all(&install_dir).await?;
+            }
         } else {
              async_fs::remove_dir_all(&install_dir).await?;
         }
@@ -1039,12 +1492,13 @@ async fn install_self() -> Result<()> {
     // 2. Extract Binaries
     println!("Extracting binaries...");
     
-    // Copy Self (lunu.exe)
+    // Copy Self
     let current_exe = std::env::current_exe()?;
-    let target_lunu = install_dir.join("lunu.exe");
+    let target_lunu = install_dir.join(lunu_bin_filename());
     
-    println!("  Copying lunu.exe...");
+    println!("  Copying {}...", lunu_bin_filename());
     async_fs::copy(&current_exe, &target_lunu).await?;
+    ensure_executable(&target_lunu)?;
 
     // 3. Setup PATH
     println!("Setting up PATH...");
@@ -1230,6 +1684,49 @@ async fn ensure_project_files(root: &Path, runtime: RuntimeKind) -> Result<()> {
 async fn update_luaurc(root: &Path, deps: &BTreeMap<String, DependencySpec>, runtime: RuntimeKind) -> Result<()> {
     let config_path = root.join(".luaurc");
     let mut luaurc = Luaurc::load(&config_path).await?;
+    let path_to_alias = |path: &Path| -> String {
+        path.to_string_lossy().replace("\\", "/") + "/"
+    };
+    if runtime == RuntimeKind::Lute {
+        luaurc.remove_alias("@lute");
+        luaurc.remove_alias("@std");
+        let mut added = false;
+        let runtime_root = runtime_lib_root(RuntimeTarget::Lute);
+        let lute_dir = runtime_root.join("lute");
+        let std_dir = runtime_root.join("std");
+        let lute_std_libs = runtime_root.join("lute").join("std").join("libs");
+        if lute_std_libs.exists() {
+            luaurc.add_alias("lute", &path_to_alias(&lute_std_libs));
+            added = true;
+        } else if lute_dir.exists() {
+            luaurc.add_alias("lute", &path_to_alias(&lute_dir));
+            added = true;
+        }
+        if std_dir.exists() {
+            luaurc.add_alias("std", &path_to_alias(&std_dir));
+            added = true;
+        } else if lute_std_libs.exists() {
+            luaurc.add_alias("std", &path_to_alias(&lute_std_libs));
+            added = true;
+        }
+        if !added {
+            let source_root = ensure_lute_sources().await?;
+            let lute_src = source_root.join("lute");
+            let std_src = source_root.join("std");
+            let source_lute_std_libs = source_root.join("lute").join("std").join("libs");
+            if source_lute_std_libs.exists() {
+                luaurc.add_alias("lute", &path_to_alias(&source_lute_std_libs));
+                luaurc.add_alias("std", &path_to_alias(&source_lute_std_libs));
+            } else {
+                if lute_src.exists() {
+                    luaurc.add_alias("lute", &path_to_alias(&lute_src));
+                }
+                if std_src.exists() {
+                    luaurc.add_alias("std", &path_to_alias(&std_src));
+                }
+            }
+        }
+    }
     if runtime == RuntimeKind::Lune {
         let lunu_alias = if root.join("Lunu").exists() {
             "Lunu/".to_string()
@@ -1251,11 +1748,26 @@ async fn update_luaurc(root: &Path, deps: &BTreeMap<String, DependencySpec>, run
     Ok(())
 }
 
+async fn ensure_runtime_aliases(root: &Path, runtime: RuntimeKind) -> Result<()> {
+    let config_path = project_config_path(root);
+    if !config_path.exists() {
+        return Ok(());
+    }
+    let cfg = ProjectConfig::load(&config_path).await?;
+    update_luaurc(root, &cfg.dependencies, runtime).await?;
+    Ok(())
+}
+
 async fn init_project(root: &Path) -> Result<()> {
     let runtime = select_runtime()?;
+    ensure_runtime_available(root, runtime_target_from_kind(runtime)).await?;
     let toolchain = if runtime == RuntimeKind::Lute {
         if find_lute_executable(root).is_none() {
-            return Err(anyhow::anyhow!("Lute runtime not found. Set LUTE_PATH, place bin/lute.exe in the project, or add lute.exe to PATH."));
+            return Err(anyhow::anyhow!(format!(
+                "Lute runtime not found. Set LUTE_PATH, place bin/{} in the project, or add {} to PATH.",
+                runtime_bin_filename(RuntimeTarget::Lute),
+                runtime_bin_filename(RuntimeTarget::Lute)
+            )));
         }
         let detection = detect_cpp_toolchain();
         if detection.c_compiler.is_none() || detection.cpp_compiler.is_none() {
@@ -1579,6 +2091,11 @@ async fn create_module(root: &Path, name: &str, lang: ModuleLang) -> Result<()> 
         async_fs::write(&worker_path, worker_content).await?;
     }
 
+    let rust_worker_cmd = if let Some(ext) = executable_extension() {
+        format!("target/release/{}.{}", name, ext)
+    } else {
+        format!("target/release/{}", name)
+    };
     let bridge_json = match lang {
         ModuleLang::Python => serde_json::json!({
             "protocol": "lunu-worker-v1",
@@ -1593,7 +2110,7 @@ async fn create_module(root: &Path, name: &str, lang: ModuleLang) -> Result<()> 
         ModuleLang::Rust => serde_json::json!({
             "protocol": "lunu-worker-v1",
             "worker": { 
-                "cmd": [format!("target/release/{}.exe", name)], 
+                "cmd": [rust_worker_cmd], 
                 "cwd": ".", 
                 "env": {},
                 "notes": "Run 'cargo build --release' in this folder to build the worker."
@@ -1632,7 +2149,7 @@ fn profile_script(root: &Path, script: &Path, runs: u32) -> Result<()> {
 }
 
 fn find_lune_executable(root: &Path) -> Option<PathBuf> {
-    let local = root.join("bin").join("lune.exe");
+    let local = root.join("bin").join(runtime_bin_filename(RuntimeTarget::Lune));
     if local.exists() {
         return Some(local);
     }
@@ -1646,11 +2163,11 @@ fn find_lune_executable(root: &Path) -> Option<PathBuf> {
     if cached.exists() {
         return Some(cached);
     }
-    find_in_path("lune.exe")
+    find_in_path(&runtime_bin_filename(RuntimeTarget::Lune))
 }
 
 fn find_lute_executable(root: &Path) -> Option<PathBuf> {
-    let local = root.join("bin").join("lute.exe");
+    let local = root.join("bin").join(runtime_bin_filename(RuntimeTarget::Lute));
     if local.exists() {
         return Some(local);
     }
@@ -1664,7 +2181,7 @@ fn find_lute_executable(root: &Path) -> Option<PathBuf> {
     if cached.exists() {
         return Some(cached);
     }
-    if let Some(p) = find_in_path("lute.exe") {
+    if let Some(p) = find_in_path(&runtime_bin_filename(RuntimeTarget::Lute)) {
         return Some(p);
     }
     ensure_embedded_lute()
@@ -1682,7 +2199,14 @@ fn find_in_path(binary: &str) -> Option<PathBuf> {
 }
 
 fn embedded_lute_bytes() -> Option<&'static [u8]> {
-    Some(include_bytes!("../resources/lute.exe"))
+    #[cfg(windows)]
+    {
+        Some(include_bytes!("../resources/lute.exe"))
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
 }
 
 async fn run_tests(root: &Path, specific_file: Option<PathBuf>, runtime: RuntimeKind) -> Result<()> {
@@ -1781,7 +2305,11 @@ fn run_script(root: &Path, script: &Path, args: &[String], runtime: RuntimeKind)
     }
     let status = match runtime {
         RuntimeKind::Lute => {
-            let lute = find_lute_executable(root).ok_or_else(|| anyhow::anyhow!("Lute runtime not found. Set LUTE_PATH, place bin/lute.exe in the project, or add lute.exe to PATH."))?;
+            let lute = find_lute_executable(root).ok_or_else(|| anyhow::anyhow!(format!(
+                "Lute runtime not found. Set LUTE_PATH, place bin/{} in the project, or add {} to PATH.",
+                runtime_bin_filename(RuntimeTarget::Lute),
+                runtime_bin_filename(RuntimeTarget::Lute)
+            )))?;
             Command::new(&lute)
                 .arg("run")
                 .arg(script)
@@ -1815,7 +2343,11 @@ fn build_with_lute(
     _icon: &Option<PathBuf>,
     _open_cmd: &Option<bool>,
 ) -> Result<()> {
-    let lute = find_lute_executable(root).ok_or_else(|| anyhow::anyhow!("Lute runtime not found. Set LUTE_PATH, place bin/lute.exe in the project, or add lute.exe to PATH."))?;
+    let lute = find_lute_executable(root).ok_or_else(|| anyhow::anyhow!(format!(
+        "Lute runtime not found. Set LUTE_PATH, place bin/{} in the project, or add {} to PATH.",
+        runtime_bin_filename(RuntimeTarget::Lute),
+        runtime_bin_filename(RuntimeTarget::Lute)
+    )))?;
     if !script.exists() {
         return Err(anyhow::anyhow!(format!("Input script not found: {:?}", script)));
     }
@@ -1823,7 +2355,9 @@ fn build_with_lute(
     let default_out = {
         let stem = script.file_stem().unwrap_or_default();
         let mut p = cwd.join(stem);
-        p.set_extension("exe");
+        if let Some(ext) = executable_extension() {
+            p.set_extension(ext);
+        }
         p
     };
     let out_path = output.clone().unwrap_or(default_out);
@@ -1990,7 +2524,11 @@ async fn package_project(root: &Path) -> Result<()> {
 
     let entry_path = PathBuf::from(&cfg.project.entry);
     let stem = entry_path.file_stem().and_then(|s| s.to_str()).unwrap_or("main");
-    let exe_path = root.join(format!("{}.exe", stem));
+    let exe_path = if let Some(ext) = executable_extension() {
+        root.join(format!("{}.{}", stem, ext))
+    } else {
+        root.join(stem)
+    };
     if exe_path.exists() {
         async_fs::copy(&exe_path, dist_dir.join(exe_path.file_name().unwrap())).await?;
     } else {
@@ -2043,6 +2581,8 @@ async fn check_environment(root: &Path) -> Result<()> {
 
     if config_path.exists() {
         if let Ok(cfg) = ProjectConfig::load(&config_path).await {
+            let runtime_kind = runtime_kind_from_config(&cfg);
+            let _ = update_luaurc(root, &cfg.dependencies, runtime_kind).await;
             if let Some(runtime) = cfg.runtime {
                 println!("- Runtime: {}", runtime.name);
                 if runtime.name == "lute" {
@@ -2176,6 +2716,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
+        std::env::remove_var("LUNU_RUNTIME");
+        std::env::remove_var("LUNU_INIT_RUNTIME");
         init_project(root).await.unwrap();
 
         assert!(root.join("lunu.toml").exists());
@@ -2191,14 +2733,21 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
+        std::env::remove_var("LUNU_RUNTIME");
+        std::env::remove_var("LUNU_INIT_RUNTIME");
         init_project(root).await.unwrap();
-        std::fs::write(root.join("main.exe"), "stub").unwrap();
+        let exe_name = if let Some(ext) = executable_extension() {
+            format!("main.{}", ext)
+        } else {
+            "main".to_string()
+        };
+        std::fs::write(root.join(&exe_name), "stub").unwrap();
 
         package_project(root).await.unwrap();
 
         let dist = root.join("dist");
         assert!(dist.exists());
-        assert!(dist.join("main.exe").exists());
+        assert!(dist.join(&exe_name).exists());
         assert!(dist.join("lunu.toml").exists());
     }
 }
