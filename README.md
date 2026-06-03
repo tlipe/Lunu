@@ -1,5 +1,15 @@
 # Lunu
 
+[![Rust](https://img.shields.io/badge/Rust-1.70+-orange)](https://www.rust-lang.org/)
+[![C](https://img.shields.io/badge/C-language-blue)](https://en.wikipedia.org/wiki/C_(programming_language))
+[![LuaU](https://img.shields.io/badge/LuaU-scripting-lightgrey)](https://create.roblox.com/docs/reference/engine/datatypes/Luau)
+[![Python](https://img.shields.io/badge/Python-3.11+-yellow)](https://www.python.org/)
+[![PowerShell](https://img.shields.io/badge/PowerShell-7.0+-darkblue)](https://learn.microsoft.com/powershell/)
+[![License](https://img.shields.io/badge/License-MIT-green)](https://github.com/yourusername/lunu/blob/main/LICENSE)
+[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/yourusername/lunu/actions)
+
+[![Download Latest Release](https://img.shields.io/badge/Download-Release-blue)](https://github.com/tlipe/Lunu/releases/latest)
+
 **Lunu** is a robust toolchain and library manager for **Luau** powered by **Lute** (native) and **Lune** (bridge). It provides a complete set of tools to develop, manage dependencies, and compile Luau projects into standalone native executables.
 
 Made in Rust 🦀
